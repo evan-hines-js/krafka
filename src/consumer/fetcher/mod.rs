@@ -531,10 +531,15 @@ impl Consumer {
                 response.error_code,
                 ErrorCode::FetchSessionIdNotFound | ErrorCode::InvalidFetchSessionEpoch
             ) {
-                warn!(
-                    "Fetch session error for broker {}: {:?}, resetting session",
+                // The broker dropped this session (evicted, or an epoch it no
+                // longer agrees with): the next fetch opens a new one. That is
+                // the protocol's recovery, so it is counted and reported at
+                // debug, not warned about on every poll.
+                debug!(
+                    "Fetch session for broker {} was not held ({:?}); reopening it",
                     broker_id, response.error_code
                 );
+                self.metrics.record_fetch_session_reset();
                 self.reset_fetch_session(broker_id, fetch_version);
                 return Ok(BrokerFetch {
                     partitions: Vec::new(),

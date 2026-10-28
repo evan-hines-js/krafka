@@ -198,6 +198,12 @@ pub struct ConsumerMetrics {
     /// out-of-range fields. Each increment also logs a `warn!` naming the
     /// partition and offset.
     pub batch_decode_errors: u64,
+    /// Fetch sessions the broker no longer held (`FetchSessionIdNotFound`,
+    /// `InvalidFetchSessionEpoch`), each reopened on the next fetch. A broker
+    /// evicting sessions faster than they are reused makes every fetch a full
+    /// one; a steady rate here says the client holds more sessions than the
+    /// broker keeps.
+    pub fetch_session_resets: u64,
     /// Records behind the end of the log, summed over assigned partitions (a
     /// gauge).
     pub lag: u64,
@@ -227,6 +233,7 @@ impl ConsumerMetrics {
         self.rebalances += other.rebalances;
         self.seeks += other.seeks;
         self.batch_decode_errors += other.batch_decode_errors;
+        self.fetch_session_resets += other.fetch_session_resets;
         self.lag += other.lag;
         self.lag_max = self.lag_max.max(other.lag_max);
         self.assigned_partitions += other.assigned_partitions;
@@ -532,6 +539,14 @@ impl Metrics {
                 "fetch.manager.batch.decode.error.total",
                 "Record batches that failed to decode.",
                 c.batch_decode_errors,
+            ),
+            s(
+                Consumer,
+                Counter,
+                "krafka_consumer_fetch_session_resets_total",
+                "fetch.manager.session.reset.total",
+                "Fetch sessions the broker no longer held, reopened on the next fetch.",
+                c.fetch_session_resets,
             ),
             s(
                 Consumer,
@@ -1165,6 +1180,7 @@ pub(crate) struct ConsumerRecorder {
     pub(crate) rebalances: Counter,
     pub(crate) seeks: Counter,
     pub(crate) batch_decode_errors: Counter,
+    pub(crate) fetch_session_resets: Counter,
     pub(crate) lag: Gauge,
     pub(crate) lag_max: Gauge,
     pub(crate) assigned_partitions: Gauge,
@@ -1199,6 +1215,11 @@ impl ConsumerRecorder {
     }
 
     #[inline]
+    pub(crate) fn record_fetch_session_reset(&self) {
+        self.fetch_session_resets.inc();
+    }
+
+    #[inline]
     pub(crate) fn record_commit(&self) {
         self.commits.inc();
     }
@@ -1220,6 +1241,7 @@ impl ConsumerRecorder {
             rebalances: self.rebalances.get(),
             seeks: self.seeks.get(),
             batch_decode_errors: self.batch_decode_errors.get(),
+            fetch_session_resets: self.fetch_session_resets.get(),
             lag: self.lag.get(),
             lag_max: self.lag_max.get(),
             assigned_partitions: self.assigned_partitions.get(),
@@ -1392,6 +1414,28 @@ mod tests {
         let after = recorder.snapshot();
         assert_eq!(before.records_sent, 5);
         assert_eq!(after.records_sent - before.records_sent, 100);
+    }
+
+    #[test]
+    fn a_fetch_session_reset_is_counted_and_rendered() {
+        let recorder = ConsumerRecorder::default();
+        recorder.record_fetch_session_reset();
+        recorder.record_fetch_session_reset();
+        let consumer = recorder.snapshot();
+        assert_eq!(consumer.fetch_session_resets, 2);
+        let metrics = Metrics {
+            consumer,
+            ..Default::default()
+        };
+        let text = metrics.prometheus_text();
+        assert!(
+            text.contains("krafka_consumer_fetch_session_resets_total 2"),
+            "{text}"
+        );
+        let mut total = Metrics::default();
+        total.add_client(&metrics);
+        total.add_client(&metrics);
+        assert_eq!(total.consumer.fetch_session_resets, 4);
     }
 
     #[test]
