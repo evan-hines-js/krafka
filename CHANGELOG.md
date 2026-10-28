@@ -17,6 +17,14 @@ not a complete record.
 
 - The `zstd` feature requires `zstd` 0.14.3, which fixes RUSTSEC-2026-0391,
   RUSTSEC-2026-0398, RUSTSEC-2026-0403 and RUSTSEC-2026-0410.
+- A broker or coordinator advertised as an IPv6 literal is reached at
+  `[host]:port`. Built as `host:port`, `::1:9092` read as one IPv6
+  address whenever the port is also a valid group (Kafka's usual ports
+  are), so the connection and the TLS server name were wrong.
+- `AdminClient::list_partition_reassignments` asks the controller, as the
+  Java client does. Sent to any broker, a ZooKeeper-mode cluster answered
+  `NOT_CONTROLLER` from every other broker, and each retry went to a
+  random one.
 
 ## [0.28.0] — 2026-10-23
 
