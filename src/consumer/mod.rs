@@ -1135,6 +1135,56 @@ impl Consumer {
             .collect())
     }
 
+    /// The group's committed offsets for the given partitions once no
+    /// transaction holds one of them staged (KIP-447 stable offsets: a
+    /// `TxnOffsetCommit` accepted and its `EndTxn` not yet applied), waiting
+    /// for those transactions to end until `deadline`. A partition the group
+    /// never committed is absent. Requires `read_committed` isolation, the
+    /// level that asks the coordinator for stable offsets.
+    ///
+    /// # Errors
+    ///
+    /// [`ErrorCode::UnstableOffsetCommit`](crate::error::ErrorCode::UnstableOffsetCommit) if an offset is still staged at
+    /// `deadline` (a deadline already past asks once);
+    /// [`KrafkaError::IllegalState`] without a `group_id` or under
+    /// `read_uncommitted`.
+    pub async fn committed_stable(
+        &self,
+        partitions: &[(&str, PartitionId)],
+        deadline: std::time::Instant,
+    ) -> Result<StdHashMap<(String, PartitionId), CommittedPosition>> {
+        if self.is_closed() {
+            return Err(KrafkaError::closed("consumer is closed"));
+        }
+        let Some(ref coordinator) = self.group_coordinator else {
+            return Err(KrafkaError::illegal_state(
+                "committed_stable() requires a group_id",
+            ));
+        };
+        if self.config.isolation_level != IsolationLevel::ReadCommitted {
+            return Err(KrafkaError::illegal_state(
+                "committed_stable() requires read_committed isolation: only it asks the \
+                 coordinator for stable offsets",
+            ));
+        }
+        if partitions.is_empty() {
+            return Ok(StdHashMap::new());
+        }
+        let mut by_topic: HashMap<String, Vec<PartitionId>> = HashMap::new();
+        for (topic, partition) in partitions {
+            validate_topic_name(topic)?;
+            by_topic
+                .entry((*topic).to_string())
+                .or_default()
+                .push(*partition);
+        }
+        Ok(coordinator
+            .fetch_stable_offsets(&by_topic, deadline)
+            .await?
+            .into_iter()
+            .collect())
+    }
+
     /// Interrupt a [`poll`](Self::poll) / [`recv`](Self::recv) from another
     /// task: a parked poll returns [`KrafkaError::Wakeup`] at once, and one
     /// that has not started yet returns it immediately. The consumer stays

@@ -905,6 +905,45 @@ impl GroupCoordinator {
         }))
     }
 
+    /// Fetch the group's committed offsets once they are stable, waiting for
+    /// every transaction that staged one of them to end, until `deadline`
+    /// (KIP-447). A taker of a partition reads where the previous owner's
+    /// last transaction left it: committed, its offset; aborted, the one
+    /// before. Past the deadline an offset still staged is
+    /// `UNSTABLE_OFFSET_COMMIT`; a deadline already past asks once.
+    pub(crate) async fn fetch_stable_offsets(
+        &self,
+        partitions: &HashMap<String, Vec<PartitionId>>,
+        deadline: std::time::Instant,
+    ) -> Result<HashMap<(String, PartitionId), crate::consumer::CommittedPosition>> {
+        let backoff = crate::util::BackoffPolicy {
+            initial_backoff: Duration::from_millis(50),
+            max_backoff: Duration::from_secs(1),
+            backoff_multiplier: 2.0,
+            jitter_factor: 0.1,
+        };
+        let mut attempt = 0;
+        loop {
+            match self.fetch_committed_offsets_once(partitions).await {
+                Err(KrafkaError::Broker {
+                    code: ErrorCode::UnstableOffsetCommit,
+                    ..
+                }) if std::time::Instant::now() < deadline => {
+                    attempt += 1;
+                    let left = deadline.saturating_duration_since(std::time::Instant::now());
+                    debug!(
+                        group = %self.group_id,
+                        attempt,
+                        "committed offsets are staged inside an in-flight transaction; \
+                         waiting for it to end"
+                    );
+                    tokio::time::sleep(backoff.calculate_backoff(attempt).min(left)).await;
+                }
+                other => return other,
+            }
+        }
+    }
+
     async fn fetch_committed_offsets_once(
         &self,
         partitions: &HashMap<String, Vec<PartitionId>>,
