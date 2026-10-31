@@ -870,6 +870,8 @@ pub(crate) struct SyncGroupReq {
     pub generation_id: i32,
     /// Member sending the request.
     pub member_id: String,
+    /// Static membership id (KIP-345), if the member has one.
+    pub group_instance_id: Option<String>,
     /// Assignments, non-empty only when sent by the group leader.
     pub assignments: Vec<SyncGroupReqAssignment>,
 }
@@ -879,7 +881,7 @@ impl SyncGroupReq {
         let group_id = read_string(buf)?;
         let generation_id = i32::decode(buf)?;
         let member_id = read_string(buf)?;
-        let _group_instance_id = read_nullable_string(buf)?;
+        let group_instance_id = read_nullable_string(buf)?;
         let count = read_array_len(buf)?;
         let mut assignments = Vec::with_capacity(count);
         for _ in 0..count {
@@ -894,6 +896,7 @@ impl SyncGroupReq {
             group_id,
             generation_id,
             member_id,
+            group_instance_id,
             assignments,
         })
     }
@@ -937,6 +940,8 @@ pub(crate) struct HeartbeatReq {
     pub generation_id: i32,
     /// Member sending the heartbeat.
     pub member_id: String,
+    /// Static membership id (KIP-345), if the member has one.
+    pub group_instance_id: Option<String>,
 }
 
 impl HeartbeatReq {
@@ -944,11 +949,12 @@ impl HeartbeatReq {
         let group_id = read_string(buf)?;
         let generation_id = i32::decode(buf)?;
         let member_id = read_string(buf)?;
-        let _group_instance_id = read_nullable_string(buf)?;
+        let group_instance_id = read_nullable_string(buf)?;
         Ok(Self {
             group_id,
             generation_id,
             member_id,
+            group_instance_id,
         })
     }
 }
@@ -1014,6 +1020,8 @@ pub(crate) struct OffsetCommitReq {
     /// Member sending the commit.
     pub member_id: String,
     /// Topics being committed.
+    /// Static membership id (KIP-345), if the member has one.
+    pub group_instance_id: Option<String>,
     pub topics: Vec<OffsetCommitReqTopic>,
 }
 
@@ -1051,7 +1059,7 @@ impl OffsetCommitReq {
         let group_id = string(buf)?;
         let generation_id = i32::decode(buf)?;
         let member_id = string(buf)?;
-        let _group_instance_id = nullable_string(buf)?;
+        let group_instance_id = nullable_string(buf)?;
         let topic_count = array_len(buf)?;
         let mut topics = Vec::with_capacity(topic_count);
         for _ in 0..topic_count {
@@ -1079,6 +1087,7 @@ impl OffsetCommitReq {
             group_id,
             generation_id,
             member_id,
+            group_instance_id,
             topics,
         })
     }
@@ -1091,6 +1100,10 @@ pub(crate) struct OffsetFetchReq {
     pub group_id: String,
     /// Requested topics and partitions; `None` means "everything committed".
     pub topics: Option<Vec<(String, Vec<i32>)>>,
+    /// Whether the caller asked for stable offsets only (KIP-447, v7+): a
+    /// partition whose offset a transaction staged and has not ended is
+    /// answered `UNSTABLE_OFFSET_COMMIT`.
+    pub require_stable: bool,
 }
 
 impl OffsetFetchReq {
@@ -1157,13 +1170,19 @@ impl OffsetFetchReq {
         if version >= 8 {
             skip_tagged_fields(buf)?;
         }
-        if version >= 7 {
-            let _require_stable = bool::decode(buf)?;
-        }
+        let require_stable = if version >= 7 {
+            bool::decode(buf)?
+        } else {
+            false
+        };
         if flexible {
             skip_tagged_fields(buf)?;
         }
-        Ok(Self { group_id, topics })
+        Ok(Self {
+            group_id,
+            topics,
+            require_stable,
+        })
     }
 }
 

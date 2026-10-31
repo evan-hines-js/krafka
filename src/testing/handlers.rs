@@ -23,7 +23,7 @@ use crate::protocol::{Decode, Encode, KafkaString, TaggedField, TryEncode};
 
 use super::state::{
     BrokerTransaction, ClassicGroupState, ClusterState, CommittedOffset,
-    ConsumerGroupHeartbeatSeen, GroupMember, LeaveGroupMemberSeen, ListOffsetsLookup,
+    ConsumerGroupHeartbeatSeen, GroupMember, GroupState, LeaveGroupMemberSeen, ListOffsetsLookup,
     SequenceCheck, ShareSession, ShareSessionClose, TxnStatus,
 };
 use super::wire::*;
@@ -63,7 +63,11 @@ pub(crate) fn supported_versions() -> Vec<(ApiKey, i16, i16)> {
         // v8 is flexible; from v9 a KIP-848 member commits with its member
         // epoch in the generation field.
         (ApiKey::OffsetCommit, 7, 9),
-        (ApiKey::OffsetFetch, 5, 5),
+        // v7 adds `require_stable` (KIP-447): a read-committed consumer asks
+        // for stable offsets, and a partition whose offset an unended
+        // transaction staged is answered `UNSTABLE_OFFSET_COMMIT`. v8 groups
+        // the request, v9 carries a KIP-848 member's id and epoch.
+        (ApiKey::OffsetFetch, 5, 9),
         // KIP-848. v1 is the only version krafka negotiates, and the only one
         // carrying the client-generated member ID (KIP-1082).
         (ApiKey::ConsumerGroupHeartbeat, 1, 1),
@@ -390,6 +394,7 @@ pub(crate) fn dispatch_error(
                 api_version,
                 &req.group_id,
                 &[],
+                &Default::default(),
                 &Default::default(),
                 code,
             )
@@ -2047,6 +2052,9 @@ fn join_group(
         .unwrap_or_default();
 
     let group = state.groups.entry(req.group_id.clone()).or_default();
+    if let Some(known) = static_rejoin(group, &req) {
+        return rejoin_static(group, known, member_id, metadata, out);
+    }
     group.protocol_type = req.protocol_type.clone();
     group.protocol_name = protocol_name.clone();
     group.generation_id += 1;
@@ -2083,6 +2091,70 @@ fn join_group(
     Ok(())
 }
 
+/// The member a static join replaces without a rebalance (KIP-345): one with
+/// the joiner's `group.instance.id` under another member id, in a stable
+/// group. A restarted process joins with its instance id and no member id;
+/// the coordinator gives it a new member id, the old one's generation and
+/// assignment, and fences the old member id ([`fenced_instance`]).
+fn static_rejoin(group: &GroupState, req: &JoinGroupReq) -> Option<usize> {
+    let instance = req.group_instance_id.as_deref()?;
+    if group.state != ClassicGroupState::Stable {
+        return None;
+    }
+    group.members.iter().position(|member| {
+        member.group_instance_id.as_deref() == Some(instance) && member.member_id != req.member_id
+    })
+}
+
+/// Answer a static rejoin ([`static_rejoin`]): the member at `known` takes
+/// `member_id`, keeping the generation, its assignment and, if it led, the
+/// leadership. A leader is handed the members so it can sync the same
+/// generation again; nobody else is told anything changed.
+fn rejoin_static(
+    group: &mut GroupState,
+    known: usize,
+    member_id: String,
+    metadata: Bytes,
+    out: &mut BytesMut,
+) -> Result<()> {
+    let old = std::mem::replace(&mut group.members[known].member_id, member_id.clone());
+    group.members[known].metadata = metadata;
+    if let Some(assignment) = group.assignments.remove(&old) {
+        group.assignments.insert(member_id.clone(), assignment);
+    }
+    if group.leader == old {
+        group.leader = member_id.clone();
+    }
+    let leads = group.leader == member_id;
+    out.put_i32(0); // throttle_time_ms
+    write_error(out, ErrorCode::None);
+    out.put_i32(group.generation_id);
+    write_nullable_string(out, group.protocol_name.as_deref())?;
+    write_string(out, &group.leader)?;
+    write_string(out, &member_id)?;
+    let members: &[GroupMember] = if leads { &group.members } else { &[] };
+    write_array_len(out, members.len())?;
+    for member in members {
+        write_string(out, &member.member_id)?;
+        write_nullable_string(out, member.group_instance_id.as_deref())?;
+        write_nullable_bytes(out, Some(&member.metadata))?;
+    }
+    Ok(())
+}
+
+/// Whether a request from `member_id` naming `instance` comes from a static
+/// member's fenced incarnation (KIP-345): the group holds `instance` under
+/// another member id, because a newer process joined with it. Kafka answers
+/// such a request `FENCED_INSTANCE_ID`, whatever its generation.
+fn fenced_instance(group: &GroupState, member_id: &str, instance: Option<&str>) -> bool {
+    let Some(instance) = instance else {
+        return false;
+    };
+    group.members.iter().any(|member| {
+        member.group_instance_id.as_deref() == Some(instance) && member.member_id != member_id
+    })
+}
+
 fn sync_group(
     body: &mut Bytes,
     node_id: i32,
@@ -2098,6 +2170,11 @@ fn sync_group(
     }
 
     let group = state.groups.entry(req.group_id.clone()).or_default();
+    if fenced_instance(group, &req.member_id, req.group_instance_id.as_deref()) {
+        out.put_i32(0);
+        write_error(out, ErrorCode::FencedInstanceId);
+        return write_nullable_bytes(out, Some(&Bytes::new()));
+    }
     if group.generation_id != req.generation_id {
         out.put_i32(0);
         write_error(out, ErrorCode::IllegalGeneration);
@@ -2209,6 +2286,11 @@ fn heartbeat(
     let code = match coordinator_check(state, &req.group_id, node_id) {
         Some(code) => code,
         None => match state.groups.get(&req.group_id) {
+            Some(group)
+                if fenced_instance(group, &req.member_id, req.group_instance_id.as_deref()) =>
+            {
+                ErrorCode::FencedInstanceId
+            }
             Some(group) if group.generation_id != req.generation_id => ErrorCode::IllegalGeneration,
             Some(group) if !group.members.iter().any(|m| m.member_id == req.member_id) => {
                 ErrorCode::UnknownMemberId
@@ -2304,6 +2386,9 @@ fn offset_commit(
                 None
             };
         }
+        if fenced_instance(group, &req.member_id, req.group_instance_id.as_deref()) {
+            return Some(ErrorCode::FencedInstanceId);
+        }
         // `generation_id == -1` is how a consumer with no group commits.
         if req.generation_id >= 0 && group.generation_id != req.generation_id {
             Some(ErrorCode::IllegalGeneration)
@@ -2389,10 +2474,21 @@ fn offset_fetch(
             &req.group_id,
             &[],
             &Default::default(),
+            &Default::default(),
             code,
         );
     }
 
+    // KIP-447: under `require_stable`, a partition whose offset a transaction
+    // has staged and not yet ended (`TxnOffsetCommit` accepted, `EndTxn` not
+    // applied) is answered `UNSTABLE_OFFSET_COMMIT`, as Kafka's
+    // `pendingTransactionalOffsetCommits` answers it: a new owner waits for
+    // the old owner's transaction rather than start before its offsets.
+    let unstable: std::collections::HashSet<(String, i32)> = if req.require_stable {
+        pending_offsets(state, &req.group_id)
+    } else {
+        Default::default()
+    };
     let group = state.groups.entry(req.group_id.clone()).or_default();
 
     // A null topics array means "everything this group has committed".
@@ -2419,8 +2515,25 @@ fn offset_fetch(
         &req.group_id,
         &requested,
         &group.offsets,
+        &unstable,
         ErrorCode::None,
     )
+}
+
+/// The partitions of `group` whose offset an unended transaction staged.
+fn pending_offsets(state: &ClusterState, group: &str) -> std::collections::HashSet<(String, i32)> {
+    state
+        .transactions
+        .values()
+        .filter(|txn| {
+            matches!(
+                txn.status,
+                TxnStatus::Ongoing | TxnStatus::PrepareCommit | TxnStatus::PrepareAbort
+            )
+        })
+        .filter_map(|txn| txn.staged_offsets.get(group))
+        .flat_map(|staged| staged.keys().cloned())
+        .collect()
 }
 
 fn write_offset_fetch_response(
@@ -2429,6 +2542,7 @@ fn write_offset_fetch_response(
     group_id: &str,
     requested: &[(String, Vec<i32>)],
     offsets: &std::collections::HashMap<(String, i32), CommittedOffset>,
+    unstable: &std::collections::HashSet<(String, i32)>,
     code: ErrorCode,
 ) -> Result<()> {
     let flexible = version >= 6;
@@ -2452,7 +2566,9 @@ fn write_offset_fetch_response(
         }
         for partition in partitions {
             out.put_i32(*partition);
-            let committed = offsets.get(&(name.clone(), *partition));
+            let key = (name.clone(), *partition);
+            let pending = unstable.contains(&key);
+            let committed = offsets.get(&key).filter(|_| !pending);
             out.put_i64(committed.map_or(NO_COMMITTED_OFFSET, |offset| offset.offset));
             out.put_i32(committed.map_or(-1, |offset| offset.leader_epoch));
             let metadata = committed.and_then(|offset| offset.metadata.as_deref());
@@ -2461,7 +2577,14 @@ fn write_offset_fetch_response(
             } else {
                 write_nullable_string(out, metadata)?;
             }
-            write_error(out, ErrorCode::None);
+            write_error(
+                out,
+                if pending {
+                    ErrorCode::UnstableOffsetCommit
+                } else {
+                    ErrorCode::None
+                },
+            );
             if flexible {
                 write_empty_tagged_fields(out)?;
             }
@@ -2833,7 +2956,9 @@ fn txn_offset_commit(
             // a coordinator that reads only the generation lets a member
             // evicted within one generation keep committing.
             Some(_) => state.groups.get(&req.group_id).and_then(|group| {
-                if req.generation_id >= 0 && group.generation_id != req.generation_id {
+                if fenced_instance(group, &req.member_id, req.group_instance_id.as_deref()) {
+                    Some(ErrorCode::FencedInstanceId)
+                } else if req.generation_id >= 0 && group.generation_id != req.generation_id {
                     Some(ErrorCode::IllegalGeneration)
                 } else if !req.member_id.is_empty()
                     && !group.members.is_empty()
