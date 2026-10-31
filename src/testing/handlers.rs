@@ -2961,7 +2961,6 @@ fn txn_offset_commit(
                 } else if req.generation_id >= 0 && group.generation_id != req.generation_id {
                     Some(ErrorCode::IllegalGeneration)
                 } else if !req.member_id.is_empty()
-                    && !group.members.is_empty()
                     && !group.members.iter().any(|m| {
                         m.member_id == req.member_id
                             || (req.group_instance_id.is_some()

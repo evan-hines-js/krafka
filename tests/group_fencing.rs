@@ -212,3 +212,24 @@ async fn a_static_member_leaving_on_shutdown_names_its_instance() {
     assert_eq!(left[0].group_instance_id.as_deref(), Some("worker-0"));
     assert!(broker.with_state(|state| state.groups[GROUP].members.is_empty()));
 }
+
+/// KIP-447: a member that left its group is unknown to it, so a
+/// transaction's offsets under its metadata are refused
+/// `UNKNOWN_MEMBER_ID`, though the group is empty now.
+#[tokio::test]
+async fn a_member_that_left_commits_no_offsets() {
+    let broker = broker().await;
+    let consumer = member(&broker, None).await;
+    let gone = metadata(&consumer).await;
+    consumer.close().await.expect("closed");
+
+    let producer = producer(&broker, "owner-0").await;
+    producer.begin().expect("begun");
+    let refused = producer
+        .send_offsets(&offset(4), &gone)
+        .await
+        .expect_err("a departed member's offsets");
+    assert_eq!(code(&refused), Some(ErrorCode::UnknownMemberId));
+    producer.abort().await.expect("abortable, not fatal");
+    assert_ne!(broker.committed_offset(GROUP, TOPIC, 0), Some(4));
+}
