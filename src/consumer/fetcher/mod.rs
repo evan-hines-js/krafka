@@ -75,6 +75,9 @@ pub(super) struct FetchRound {
     pub(super) no_offset: Vec<PartitionKey>,
     /// Whether any fetch request was sent.
     pub(super) requested: bool,
+    /// Every broker answered, and no partition with an error: what an empty
+    /// round says is that the broker held the fetch for its whole wait.
+    pub(super) answered: bool,
 }
 
 /// One partition of a fetch response, matched to the request it answers.
@@ -156,6 +159,7 @@ impl Consumer {
 
         let mut fetched: Vec<FetchedPartition> = Vec::new();
         let mut endpoints: Vec<NodeEndpoint> = Vec::new();
+        let answered = responses.iter().all(Result::is_ok);
         for ((broker_id, targets), response) in plan.by_broker.iter().zip(responses) {
             match response {
                 Ok(fetch) => {
@@ -180,8 +184,12 @@ impl Consumer {
                 }
             }
         }
+        let clean = fetched
+            .iter()
+            .all(|p| p.error_code.is_ok() && p.diverging_epoch.is_none());
         let mut round = self.apply_fetched(fetched, &endpoints, budget).await;
         round.requested = true;
+        round.answered = answered && clean && round.faults.is_empty() && round.no_offset.is_empty();
         Ok(round)
     }
 
