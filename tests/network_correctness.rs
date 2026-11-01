@@ -12,7 +12,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::{BufMut, Bytes, BytesMut};
-use krafka::__private::network::{BrokerConnection, ConnectionConfig, ConnectionPool};
+use krafka::__private::network::{
+    BrokerConnection, ConnectionConfig, ConnectionPool, CoordinationChannel,
+};
 use krafka::__private::protocol::{ApiKey, Compression, RecordBatch, RecordBatchBuilder};
 use krafka::error::KrafkaError;
 use krafka::testing::{Control, FakeBroker};
@@ -197,12 +199,19 @@ async fn the_coordinator_gets_its_own_connection() {
     let addr = broker.bootstrap_servers();
     let pool = ConnectionPool::new(ConnectionConfig::default());
 
+    let member = CoordinationChannel::next();
     let data = pool.get_connection(&addr).await.unwrap();
-    let coordination = pool.get_coordinator_connection(&addr).await.unwrap();
+    let coordination = pool
+        .get_coordinator_connection(&addr, member)
+        .await
+        .unwrap();
     assert!(!Arc::ptr_eq(&data, &coordination), "a separate socket");
     assert!(Arc::ptr_eq(
         &coordination,
-        &pool.get_coordinator_connection(&addr).await.unwrap()
+        &pool
+            .get_coordinator_connection(&addr, member)
+            .await
+            .unwrap()
     ));
     assert_eq!(pool.metrics().connections_created, 2);
 
@@ -218,19 +227,47 @@ async fn the_coordinator_gets_its_own_connection() {
     assert_eq!(pool.metrics().active_connections, 0);
 }
 
+/// Two members of one pool never share a coordination socket: the
+/// coordinator holds a member's `JoinGroup` until its group converges, and
+/// the other member's requests would wait behind it.
+#[tokio::test]
+async fn every_member_gets_a_coordination_connection_of_its_own() {
+    let broker = FakeBroker::start().await.unwrap();
+    let addr = broker.bootstrap_servers();
+    let pool = ConnectionPool::new(ConnectionConfig::default());
+
+    let first = pool
+        .get_coordinator_connection(&addr, CoordinationChannel::next())
+        .await
+        .unwrap();
+    let second = pool
+        .get_coordinator_connection(&addr, CoordinationChannel::next())
+        .await
+        .unwrap();
+    assert!(!Arc::ptr_eq(&first, &second), "a socket per member");
+    assert_eq!(pool.metrics().connections_created, 2);
+    assert_eq!(pool.connection_count(), 2);
+}
+
 #[tokio::test]
 async fn at_the_cap_coordination_falls_back_to_the_data_connection() {
     let broker = FakeBroker::start().await.unwrap();
     let addr = broker.bootstrap_servers();
     let pool = ConnectionPool::new(ConnectionConfig::default()).with_max_total_connections(1);
 
+    let member = CoordinationChannel::next();
     let data = pool.get_connection(&addr).await.unwrap();
-    let coordination = pool.get_coordinator_connection(&addr).await.unwrap();
+    let coordination = pool
+        .get_coordinator_connection(&addr, member)
+        .await
+        .unwrap();
     assert!(
         Arc::ptr_eq(&data, &coordination),
         "shares the data connection"
     );
-    pool.get_coordinator_connection(&addr).await.unwrap();
+    pool.get_coordinator_connection(&addr, member)
+        .await
+        .unwrap();
     assert_eq!(pool.metrics().coordination_fallbacks, 2);
     assert_eq!(pool.metrics().connections_created, 1);
 }

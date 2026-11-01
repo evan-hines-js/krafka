@@ -184,6 +184,8 @@ pub(crate) struct GroupCoordinator {
     /// coordination connection, fetched per request so the pool's
     /// replacement rules (dead socket, KIP-368 re-authentication) apply.
     coordinator_addr: RwLock<Option<String>>,
+    /// This member's own coordination connection to it.
+    channel: crate::network::CoordinationChannel,
     coordinator_id: Mutex<Option<i32>>,
     inner: Arc<RwLock<GroupInner>>,
     heartbeat: Arc<HeartbeatController>,
@@ -259,6 +261,7 @@ impl GroupCoordinator {
             heartbeat_interval,
             rebalance_timeout,
             coordinator_addr: RwLock::new(None),
+            channel: crate::network::CoordinationChannel::next(),
             coordinator_id: Mutex::new(None),
             inner: Arc::new(RwLock::new(GroupInner::initial())),
             heartbeat: Arc::new(HeartbeatController::default()),
@@ -627,7 +630,7 @@ impl GroupCoordinator {
             }
         };
         self.pool
-            .get_coordinator_connection(&address)
+            .get_coordinator_connection(&address, self.channel)
             .await
             .inspect_err(|_| self.drop_coordinator())
     }

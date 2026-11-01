@@ -173,6 +173,20 @@ impl Kafka {
         total
     }
 
+    /// The broker leading `topic`'s `partition` as this handle's metadata
+    /// cache holds it now; no request is sent. `None` while the cache does
+    /// not know the topic (a client of the handle fetching it, or assigning
+    /// it, loads it) or the partition has no leader.
+    pub fn leader(&self, topic: &str, partition: crate::PartitionId) -> Option<crate::BrokerId> {
+        self.inner.metadata.leader(topic, partition)
+    }
+
+    /// The broker connections this handle's pool holds open now, every
+    /// purpose counted: what its clients cost the brokers.
+    pub fn open_connections(&self) -> usize {
+        self.inner.pool.connection_count()
+    }
+
     /// Count `source` in [`Kafka::metrics`] while it lives.
     pub(crate) fn register_metrics(&self, source: &Arc<MetricsSource>) {
         let mut clients = self.inner.clients.lock();
