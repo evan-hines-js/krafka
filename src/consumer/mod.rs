@@ -620,10 +620,8 @@ impl Consumer {
                 max.saturating_add(headroom)
             });
             let remaining = deadline.saturating_duration_since(Instant::now());
-            let round = match self
-                .fetch_round(self.config.fetch_max_wait.min(remaining), budget)
-                .await
-            {
+            let wait = self.config.fetch_max_wait.min(remaining);
+            let round = match self.fetch_round(wait, budget).await {
                 Err(KrafkaError::Wakeup) => {
                     self.wakeup_flag.store(false, Ordering::Release);
                     return Err(KrafkaError::Wakeup);
@@ -639,6 +637,15 @@ impl Consumer {
             }
             if self.state.lock().has_deliverable() {
                 continue;
+            }
+            // A fetch the broker was asked to hold for the rest of the poll
+            // was answered empty, with no error: the poll's wait is over. A broker answers at
+            // its max wait in whole milliseconds, a little before the
+            // client's deadline, and fetching again for the sliver left
+            // sends another empty fetch per poll (Redpanda: exactly two per
+            // idle poll).
+            if round.answered && wait == remaining {
+                break;
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
