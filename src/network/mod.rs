@@ -22,6 +22,6 @@ pub use transport::{TransportConfig, TransportConfigBuilder};
 #[cfg_attr(not(feature = "internal"), allow(unused_imports))]
 pub use connection::{BrokerFeatures, ConnectionConfigBuilder, ProxyCredentials};
 #[cfg_attr(not(feature = "internal"), allow(unused_imports))]
-pub use pool::{ConnectionPurpose, DEFAULT_MAX_IDLE};
+pub use pool::{ConnectionPurpose, CoordinationChannel, DEFAULT_MAX_IDLE};
 #[cfg_attr(not(feature = "internal"), allow(unused_imports))]
 pub use secure::{ChallengeResponse, SaslAuthenticator};

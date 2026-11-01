@@ -1,10 +1,15 @@
 //! Connection pool for managing broker connections.
 //!
 //! - **One data connection per broker**, multiplexed, as the Java client
-//!   keeps one per node. A group coordinator gets a second connection
-//!   ([`ConnectionPurpose::Coordination`]) so its heartbeats never queue
-//!   behind fetches and produces on the broker's one-request-at-a-time
-//!   socket.
+//!   keeps one per node. Each group member gets a coordination connection
+//!   of its own to its coordinator ([`ConnectionPurpose::Coordination`],
+//!   one per [`CoordinationChannel`]) so its heartbeats never queue behind
+//!   fetches and produces on the broker's one-request-at-a-time socket, nor
+//!   behind another member's `JoinGroup`, which the coordinator holds until
+//!   that member's group converges: members of a handle sharing one socket
+//!   would wait on each other's rebalances (and two processes whose members
+//!   of two groups each wait behind the other's join would wait out the
+//!   rebalance timeout).
 //! - **One dial per call.** `get_connection*` makes at most one connection
 //!   attempt, bounded by `connect_timeout`; concurrent callers for the same
 //!   connection share it. The caller's own deadline applies by dropping the
@@ -62,10 +67,24 @@ const RECONNECT_BACKOFF: BackoffPolicy = BackoffPolicy {
 pub enum ConnectionPurpose {
     /// Produce, fetch, metadata, admin and every other request.
     Data,
-    /// Requests a group member sends to its group coordinator: `JoinGroup`,
-    /// `SyncGroup`, `Heartbeat`, `LeaveGroup`, `ConsumerGroupHeartbeat`,
-    /// `ShareGroupHeartbeat`, `OffsetCommit` and `OffsetFetch`.
-    Coordination,
+    /// Requests one group member sends to its group coordinator:
+    /// `JoinGroup`, `SyncGroup`, `Heartbeat`, `LeaveGroup`,
+    /// `ConsumerGroupHeartbeat`, `ShareGroupHeartbeat`, `OffsetCommit` and
+    /// `OffsetFetch`, on that member's own channel.
+    Coordination(CoordinationChannel),
+}
+
+/// One group member's coordination connection: every member of a pool
+/// takes a channel of its own ([`CoordinationChannel::next`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CoordinationChannel(u64);
+
+impl CoordinationChannel {
+    /// A channel no member of this process has had.
+    pub fn next() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        Self(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
 }
 
 /// A pooled connection's identity: where it goes and what it carries.
@@ -307,15 +326,22 @@ impl ConnectionPool {
         self.get(address, ConnectionPurpose::Data).await
     }
 
-    /// Get or create the coordination connection to a group coordinator.
+    /// Get or create one member's coordination connection to its group
+    /// coordinator.
     ///
     /// A separate connection from the data connection to the same address,
-    /// so coordination requests are never queued behind data requests. When
+    /// and from every other member's, so coordination requests are never
+    /// queued behind data requests or another member's join. When
     /// the connection cap leaves no room for it, the data connection is used
     /// instead; the pool's `coordination_fallbacks` counter counts those
     /// calls and the pool logs one warning.
-    pub async fn get_coordinator_connection(&self, address: &str) -> Result<Arc<BrokerConnection>> {
-        self.get(address, ConnectionPurpose::Coordination).await
+    pub async fn get_coordinator_connection(
+        &self,
+        address: &str,
+        channel: CoordinationChannel,
+    ) -> Result<Arc<BrokerConnection>> {
+        self.get(address, ConnectionPurpose::Coordination(channel))
+            .await
     }
 
     /// Get or create the data connection to a broker by ID.
@@ -364,7 +390,7 @@ impl ConnectionPool {
             DialStart::Ready(conn) => return Ok(conn),
             DialStart::Wait(rx) => rx,
             DialStart::CapReached(limit) => {
-                if purpose == ConnectionPurpose::Coordination {
+                if matches!(purpose, ConnectionPurpose::Coordination(_)) {
                     self.record_coordination_fallback(address, limit);
                     return Box::pin(self.get(address, ConnectionPurpose::Data)).await;
                 }
@@ -819,6 +845,12 @@ impl ConnectionPool {
     pub fn len(&self) -> usize {
         let s = self.state.read();
         s.by_id.values().filter(|c| c.is_usable()).count()
+    }
+
+    /// Every usable connection the pool holds, of every purpose.
+    pub fn connection_count(&self) -> usize {
+        let s = self.state.read();
+        s.by_key.values().filter(|c| c.is_usable()).count()
     }
 
     /// Returns `true` if no usable connections known by broker ID exist.

@@ -220,6 +220,7 @@ impl ShareConsumerBuilder {
             config,
             metadata: Arc::clone(kafka.metadata()),
             pool: Arc::clone(kafka.pool()),
+            channel: crate::network::CoordinationChannel::next(),
             metrics,
             metrics_source,
             telemetry,
