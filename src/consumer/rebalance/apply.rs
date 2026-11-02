@@ -12,7 +12,9 @@ use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use tracing::{Instrument, debug, warn};
 
 use crate::PartitionId;
-use crate::consumer::group::{GroupCoordinator, MemberAssignment, is_coordinator_retriable};
+use crate::consumer::group::{
+    GroupCoordinator, JoinRound, MemberAssignment, is_coordinator_retriable,
+};
 use crate::consumer::state::PartitionKey;
 use crate::consumer::{Consumer, TopicPartition};
 use crate::error::{ErrorCode, KrafkaError, Result};
@@ -113,17 +115,22 @@ impl Consumer {
     async fn apply_join(
         &self,
         coordinator: &Arc<GroupCoordinator>,
-        outcome: Result<MemberAssignment>,
+        outcome: Result<JoinRound>,
     ) -> Result<()> {
         match outcome {
-            Ok(assignment) => {
+            Ok(round) => {
+                let owes_rejoin = round.gave_up_reported();
                 let protocol = if coordinator.is_cooperative() {
                     Protocol::Cooperative
                 } else {
                     Protocol::Eager
                 };
-                self.apply_assignment(coordinator, assignment, protocol)
-                    .await
+                self.apply_assignment(coordinator, round.assignment, protocol)
+                    .await?;
+                if owes_rejoin {
+                    coordinator.request_rejoin();
+                }
+                Ok(())
             }
             Err(error)
                 if error.is_retriable()

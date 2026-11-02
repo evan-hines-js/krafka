@@ -1,5 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+use std::collections::BTreeSet;
+
 use proptest::prelude::*;
 
 use super::*;
@@ -209,6 +211,44 @@ fn withholding_removes_only_partitions_moving_between_live_members() {
     );
     withhold_transferring_partitions(&mut next, &members);
     assert_eq!(counts(&next, &["m1", "m2"]), vec![2, 2]);
+}
+
+/// The claims-driver group of 2026-11-02: ten members, sixty partitions, and
+/// one member whose join still reported the twenty it held when the join
+/// left, fourteen of which it had given up by the time the round ended. The
+/// round withholds those fourteen from everyone and hands out the rest, so
+/// only that member's `reported - assigned` can ever bring them back.
+#[test]
+fn a_stale_claim_withholds_what_only_its_claimant_can_bring_back() {
+    let mut claimed = MemberAssignment::empty();
+    claimed.add("t", (40..60).collect());
+    let mut members = vec![owning("m0", &["t"], &claimed, 26)];
+    for id in 1..10 {
+        members.push(member(&format!("m{id}"), &["t"]));
+    }
+    let mut out = assign(
+        PartitionAssignmentStrategy::CooperativeSticky,
+        &members,
+        &partitions(&[("t", 60)]),
+    );
+    withhold_transferring_partitions(&mut out, &members);
+
+    let mut kept: Vec<PartitionId> = out["m0"].all_partitions().map(|(_, p)| p).collect();
+    kept.sort_unstable();
+    assert_eq!(kept, (54..60).collect::<Vec<_>>());
+    let given: BTreeSet<PartitionId> = out
+        .values()
+        .flat_map(|m| m.all_partitions())
+        .map(|(_, p)| p)
+        .collect();
+    assert_eq!(given.len(), 46, "{given:?}");
+    let orphaned: Vec<PartitionId> = (0..60).filter(|p| !given.contains(p)).collect();
+    assert_eq!(orphaned.len(), 14, "{orphaned:?}");
+    assert!(
+        orphaned
+            .iter()
+            .all(|p| (40..60).contains(p) && !kept.contains(p))
+    );
 }
 
 #[test]

@@ -361,3 +361,27 @@ async fn a_join_outcome_is_parked_for_the_next_poll() {
     );
     assert!(c.take_pending_rebalance().is_none(), "exactly once");
 }
+
+/// A round whose assignment leaves out a partition its join reported owning
+/// was the one that withheld that partition, whatever this member's state
+/// says by the time the round is applied: the member gave it up to a
+/// rebalance it has already applied, and only its rejoin brings the partition
+/// back. The leader withholds a partition from everyone until then, and the
+/// group reads Stable with the partition unowned (2026-11-02: fourteen of the
+/// claims-driver group's sixty, for good).
+#[test]
+fn a_round_that_leaves_out_a_reported_partition_owes_a_rejoin() {
+    let mut reported = HashMap::new();
+    reported.insert("t".to_string(), vec![40, 41, 54, 55]);
+    let kept = |partitions: Vec<PartitionId>| {
+        let mut assignment = MemberAssignment::empty();
+        assignment.add("t", partitions);
+        JoinRound {
+            assignment,
+            reported: reported.clone(),
+        }
+    };
+    assert!(kept(vec![54, 55]).gave_up_reported());
+    assert!(!kept(vec![40, 41, 54, 55]).gave_up_reported());
+    assert!(!kept(vec![40, 41, 54, 55, 56]).gave_up_reported());
+}
