@@ -1359,7 +1359,9 @@ impl TransactionalProducer {
     /// soon as they are all **queued**: [`enqueue`](Self::enqueue) of each,
     /// with every partition they route to registered first in one
     /// `AddPartitionsToTxn` (TV1). Enqueuing them one by one costs one
-    /// coordinator round trip, in series, per partition.
+    /// coordinator round trip, in series, per partition. The last record
+    /// queued sends them: a batch per partition without waiting for `linger`,
+    /// in one `Produce` per broker while they fit `max_request_size`.
     ///
     /// Each record is routed here, once: it is sent to the partition chosen
     /// here. An interceptor that moves a record to another topic or partition
@@ -1387,6 +1389,10 @@ impl TransactionalProducer {
         for record in records {
             handles.push(self.enqueue(record).await?);
         }
+        // The records are complete: their batches go now, whole, not when
+        // `linger` happens to pass.
+        let generation = self.producer.barrier.snapshot();
+        self.producer.accumulator.flush(generation);
         Ok(handles)
     }
 
