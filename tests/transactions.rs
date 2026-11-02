@@ -566,6 +566,9 @@ async fn enqueue_all_sends_one_produce_without_waiting_for_linger() {
         let _ = handle.await.unwrap();
     }
     assert_eq!(broker.request_count(ApiKey::Produce), 1);
+    let sent = producer.metrics().producer;
+    assert_eq!(sent.produce_requests, 1);
+    assert_eq!(sent.partition_registrations, 1);
     producer.commit().await.unwrap();
 }
 
