@@ -541,6 +541,34 @@ async fn enqueue_all_registers_every_partition_in_one_request() {
     producer.commit().await.unwrap();
 }
 
+/// `enqueue_all` ends the batching itself: the records go as one `Produce` of
+/// a batch per partition, at once, under a `linger` no test would outlast.
+#[tokio::test]
+async fn enqueue_all_sends_one_produce_without_waiting_for_linger() {
+    let broker = FakeBroker::start().await.unwrap();
+    broker.create_topic("facts", 24);
+    let producer = krafka::Kafka::builder(broker.bootstrap_servers())
+        .connect()
+        .await
+        .unwrap()
+        .producer()
+        .linger(Duration::from_secs(600))
+        .delivery_timeout(Duration::from_secs(1200))
+        .build_transactional("txn-one-produce")
+        .await
+        .unwrap();
+    producer.begin().unwrap();
+    let records = (0..240)
+        .map(|n| Record::new("facts", format!("value-{n}")).key(format!("key-{n}")))
+        .collect();
+    broker.clear_requests();
+    for handle in producer.enqueue_all(records).await.unwrap() {
+        let _ = handle.await.unwrap();
+    }
+    assert_eq!(broker.request_count(ApiKey::Produce), 1);
+    producer.commit().await.unwrap();
+}
+
 /// The cost `enqueue_all` removes: `enqueue` of each record registers each new
 /// partition in a request of its own.
 #[tokio::test]
