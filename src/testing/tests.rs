@@ -3584,6 +3584,39 @@ async fn the_fake_brokers_two_record_views_differ_by_the_aborted_records() {
     let _ = consumer.close().await;
 }
 
+/// A round's `TxnOffsetCommit` costs no `FindCoordinator` of its own: the
+/// group's coordinator is asked again only after it stops answering as one.
+#[tokio::test]
+async fn a_producer_asks_for_its_groups_coordinator_once_until_it_moves() {
+    let broker = FakeBroker::start().await.unwrap();
+    broker.create_topic("orders", 1);
+    let producer = txn_producer_for(&broker, "txn-group-coordinator").await;
+    let group = crate::consumer::ConsumerGroupMetadata::new("etl-group", 7, "member-1", None);
+    let offsets = vec![TopicPartitionOffset::new("orders", 0, 42)];
+    let round = || async {
+        producer.begin().expect("begin");
+        producer
+            .send_offsets(&offsets, &group)
+            .await
+            .expect("offsets");
+        // Aborted: a committed offset would make the fake's group refuse
+        // this memberless metadata.
+        producer.abort().await.expect("abort");
+    };
+
+    round().await;
+    broker.clear_requests();
+    round().await;
+    round().await;
+    assert_eq!(broker.request_count(ApiKey::FindCoordinator), 0);
+
+    broker.on_once(ApiKey::TxnOffsetCommit, |_| {
+        Control::Error(ErrorCode::NotCoordinator)
+    });
+    round().await;
+    assert_eq!(broker.request_count(ApiKey::FindCoordinator), 1);
+}
+
 /// Offsets sent to a transaction must move only when the transaction commits.
 ///
 /// This is the consume-transform-produce guarantee: an aborted transaction

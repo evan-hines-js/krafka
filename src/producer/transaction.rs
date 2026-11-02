@@ -479,6 +479,15 @@ struct TxnPartition {
     partition: PartitionId,
 }
 
+/// A group's coordinator, as `FindCoordinator` named it.
+#[derive(Debug, Clone)]
+struct GroupCoordinator {
+    group: String,
+    node_id: i32,
+    host: String,
+    port: i32,
+}
+
 /// State of a partition within the current transaction.
 #[derive(Debug, Clone)]
 enum PartitionAddState {
@@ -720,6 +729,9 @@ pub struct TransactionalProducer {
     reinit_lock: tokio::sync::Mutex<()>,
     /// Transaction coordinator broker ID.
     coordinator_id: RwLock<Option<i32>>,
+    /// The coordinator of the group whose offsets this producer last sent:
+    /// asked once, and again only after it stops answering as coordinator.
+    group_coordinator: parking_lot::Mutex<Option<GroupCoordinator>>,
     /// Partitions registered with the coordinator in the current transaction
     /// (TV1).
     txn_partitions: Arc<RwLock<TransactionPartitions>>,
@@ -757,6 +769,7 @@ impl TransactionalProducer {
             reinit_required: AtomicBool::new(false),
             reinit_lock: tokio::sync::Mutex::new(()),
             coordinator_id: RwLock::new(None),
+            group_coordinator: parking_lot::Mutex::new(None),
             txn_partitions: Arc::new(RwLock::new(TransactionPartitions::default())),
             backoff,
         };
@@ -1645,16 +1658,42 @@ impl TransactionalProducer {
             self.deadline(),
             "TxnOffsetCommit",
             |attempt| async move {
-                let (group_node_id, group_host, group_port) =
-                    self.find_group_coordinator(group_id, attempt).await?;
-                let group_conn = self
-                    .pool()
-                    .get_connection_by_id(
-                        group_node_id,
-                        &crate::util::broker_address(&group_host, group_port),
-                    )
-                    .await?;
-                let version = group_conn
+                let result = self
+                    .txn_offset_commit(group_id, commit_request, toc_min_version, attempt)
+                    .await;
+                if let Err(error) = &result
+                    && Self::needs_coordinator_refresh(error)
+                {
+                    *self.group_coordinator.lock() = None;
+                }
+                result
+            },
+        )
+        .await;
+        let result = self.classify_transaction_result(result);
+        if result.is_ok() {
+            debug!("Added offsets to transaction for group {}", group_id);
+        }
+        result
+    }
+
+    /// One `TxnOffsetCommit` to the group's coordinator.
+    async fn txn_offset_commit(
+        &self,
+        group_id: &str,
+        commit_request: &TxnOffsetCommitRequest,
+        toc_min_version: i16,
+        attempt: u32,
+    ) -> Result<()> {
+        let coordinator = self.group_coordinator(group_id, attempt).await?;
+        let group_conn = self
+            .pool()
+            .get_connection_by_id(
+                coordinator.node_id,
+                &crate::util::broker_address(&coordinator.host, coordinator.port),
+            )
+            .await?;
+        let version = group_conn
                     .negotiate_api_version(
                         ApiKey::TxnOffsetCommit,
                         versions::TXN_OFFSET_COMMIT_MAX,
@@ -1668,40 +1707,32 @@ impl TransactionalProducer {
                             ),
                         )
                     })?;
-                let mut bytes = group_conn
-                    .send_request(ApiKey::TxnOffsetCommit, version, |buf| {
-                        commit_request.encode_versioned(version, buf)
-                    })
-                    .await?;
-                let response = TxnOffsetCommitResponse::decode_versioned(version, &mut bytes)?;
-                if !response.is_ok() {
-                    for topic_result in &response.topics {
-                        for part_result in &topic_result.partitions {
-                            if !part_result.error_code.is_ok() {
-                                return Err(KrafkaError::broker(
-                                    part_result.error_code,
-                                    format!(
-                                        "failed to commit offset for {}-{} in transaction",
-                                        topic_result.name, part_result.partition
-                                    ),
-                                ));
-                            }
-                        }
+        let mut bytes = group_conn
+            .send_request(ApiKey::TxnOffsetCommit, version, |buf| {
+                commit_request.encode_versioned(version, buf)
+            })
+            .await?;
+        let response = TxnOffsetCommitResponse::decode_versioned(version, &mut bytes)?;
+        if !response.is_ok() {
+            for topic_result in &response.topics {
+                for part_result in &topic_result.partitions {
+                    if !part_result.error_code.is_ok() {
+                        return Err(KrafkaError::broker(
+                            part_result.error_code,
+                            format!(
+                                "failed to commit offset for {}-{} in transaction",
+                                topic_result.name, part_result.partition
+                            ),
+                        ));
                     }
-                    return Err(KrafkaError::protocol_kind(
-                        ProtocolErrorKind::Malformed,
-                        "failed to commit offsets in transaction",
-                    ));
                 }
-                Ok(())
-            },
-        )
-        .await;
-        let result = self.classify_transaction_result(result);
-        if result.is_ok() {
-            debug!("Added offsets to transaction for group {}", group_id);
+            }
+            return Err(KrafkaError::protocol_kind(
+                ProtocolErrorKind::Malformed,
+                "failed to commit offsets in transaction",
+            ));
         }
-        result
+        Ok(())
     }
 
     /// Register the consumer group's offsets topic with the transaction
@@ -1749,11 +1780,23 @@ impl TransactionalProducer {
     }
 
     /// Find the group coordinator, returning (node_id, host, port).
+    /// `group_id`'s coordinator: the one last named, or asked now.
+    async fn group_coordinator(&self, group_id: &str, attempt: u32) -> Result<GroupCoordinator> {
+        if let Some(known) = self.group_coordinator.lock().as_ref()
+            && known.group == group_id
+        {
+            return Ok(known.clone());
+        }
+        let found = self.find_group_coordinator(group_id, attempt).await?;
+        *self.group_coordinator.lock() = Some(found.clone());
+        Ok(found)
+    }
+
     async fn find_group_coordinator(
         &self,
         group_id: &str,
         attempt: u32,
-    ) -> Result<(i32, String, i32)> {
+    ) -> Result<GroupCoordinator> {
         let brokers = self.metadata().brokers();
         if brokers.is_empty() {
             return Err(KrafkaError::broker(
@@ -1798,7 +1841,12 @@ impl TransactionalProducer {
             ));
         }
 
-        Ok((response.node_id, response.host, response.port))
+        Ok(GroupCoordinator {
+            group: group_id.to_string(),
+            node_id: response.node_id,
+            host: response.host,
+            port: response.port,
+        })
     }
 
     /// Close the transaction to new sends, send what is buffered without
@@ -3308,6 +3356,7 @@ mod tests {
             reinit_required: AtomicBool::new(false),
             reinit_lock: tokio::sync::Mutex::new(()),
             coordinator_id: RwLock::new(None),
+            group_coordinator: parking_lot::Mutex::new(None),
             txn_partitions: Arc::new(RwLock::new(TransactionPartitions::default())),
             backoff,
         }
