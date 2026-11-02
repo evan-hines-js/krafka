@@ -142,6 +142,33 @@ impl MemberAssignment {
     }
 }
 
+/// A finished classic join round: what the coordinator assigned, and what
+/// this member's join told the leader it owned when the join left.
+#[derive(Debug, Clone)]
+pub(crate) struct JoinRound {
+    pub(crate) assignment: MemberAssignment,
+    pub(crate) reported: HashMap<String, Vec<PartitionId>>,
+}
+
+impl JoinRound {
+    /// Whether the assignment leaves out a partition the join reported.
+    ///
+    /// The leader withheld such a partition from every member, for the
+    /// follow-up round its reported owner starts (KIP-429). The member may
+    /// have given it up before this round is applied (a join leaves while an
+    /// earlier round's revocation runs, so its report is behind the member's
+    /// state), so comparing the assignment with the state finds nothing to
+    /// revoke: only this report says the follow-up round is owed.
+    pub(crate) fn gave_up_reported(&self) -> bool {
+        self.reported.iter().any(|(topic, partitions)| {
+            let assigned = self.assignment.partitions.get(topic);
+            partitions
+                .iter()
+                .any(|p| !assigned.is_some_and(|kept| kept.contains(p)))
+        })
+    }
+}
+
 /// Member identity and assignment, updated together so a reader never sees a
 /// generation from one join with a member id from another.
 #[derive(Debug)]
@@ -202,7 +229,7 @@ pub(crate) struct GroupCoordinator {
     heartbeat_cmd_tx: Mutex<Option<mpsc::Sender<HeartbeatCommand>>>,
     /// The outcome of a `JoinGroup`/`SyncGroup` round that ran on its own
     /// task, waiting for `poll()` to apply it.
-    pending_rebalance: Arc<Mutex<Option<Result<MemberAssignment>>>>,
+    pending_rebalance: Arc<Mutex<Option<Result<JoinRound>>>>,
     /// `true` while a join round runs. A `watch` so `poll()` can wait for it.
     rejoin_in_flight: tokio::sync::watch::Sender<bool>,
     /// Incremented every time a heartbeat task is started, so a task that is
@@ -469,7 +496,7 @@ impl GroupCoordinator {
     }
 
     /// Take the outcome of a finished join round, if any.
-    pub(crate) fn take_pending_rebalance(&self) -> Option<Result<MemberAssignment>> {
+    pub(crate) fn take_pending_rebalance(&self) -> Option<Result<JoinRound>> {
         self.pending_rebalance.lock().take()
     }
 

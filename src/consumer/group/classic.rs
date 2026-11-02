@@ -12,8 +12,8 @@ use tracing::{debug, error, info, warn};
 
 use super::heartbeat::HeartbeatCommand;
 use super::{
-    COORDINATOR_REDISCOVERY_MAX_ATTEMPTS, GroupCoordinator, GroupState, MemberAssignment,
-    is_coordinator_retriable,
+    COORDINATOR_REDISCOVERY_MAX_ATTEMPTS, GroupCoordinator, GroupState, JoinRound,
+    MemberAssignment, is_coordinator_retriable,
 };
 use crate::PartitionId;
 use crate::consumer::assignor::{self, MemberSubscription};
@@ -127,7 +127,7 @@ impl GroupCoordinator {
 
     /// One `JoinGroup`/`SyncGroup` round trip, retrying coordinator errors
     /// after re-discovery (bounded).
-    async fn join_and_sync(&self) -> Result<MemberAssignment> {
+    async fn join_and_sync(&self) -> Result<JoinRound> {
         let backoff = crate::util::BackoffPolicy::default();
         let mut last_error = None;
 
@@ -146,12 +146,24 @@ impl GroupCoordinator {
                 }
             }
 
-            let result = match self.join_group().await {
+            // Read once per attempt: what the leader is told is what the
+            // round's outcome is later compared with.
+            let reported = if self.is_cooperative() {
+                self.owned.lock().clone()
+            } else {
+                HashMap::new()
+            };
+            let result = match self.join_group(&reported).await {
                 Ok(join_response) => self.sync_group(&join_response).await,
                 Err(error) => Err(error),
             };
             match result {
-                Ok(assignment) => return Ok(assignment),
+                Ok(assignment) => {
+                    return Ok(JoinRound {
+                        assignment,
+                        reported,
+                    });
+                }
                 Err(error) if is_coordinator_retriable(&error) => {
                     debug!(
                         "Group '{}' join/sync hit {error}; re-discovering the coordinator \
@@ -172,7 +184,10 @@ impl GroupCoordinator {
     }
 
     /// Join the consumer group.
-    async fn join_group(&self) -> Result<JoinGroupResponse> {
+    async fn join_group(
+        &self,
+        owned: &HashMap<String, Vec<PartitionId>>,
+    ) -> Result<JoinGroupResponse> {
         let conn = self.get_coordinator_connection().await?;
 
         let (member_id, generation_id) = {
@@ -180,13 +195,8 @@ impl GroupCoordinator {
             (inner.member_id.clone(), inner.generation_id)
         };
         let topics = self.subscribed_topics();
-        let owned = if self.is_cooperative() {
-            self.owned.lock().clone()
-        } else {
-            HashMap::new()
-        };
 
-        let subscription = self.build_subscription(&topics, &owned, generation_id);
+        let subscription = self.build_subscription(&topics, owned, generation_id);
         let mut metadata = BytesMut::new();
         encode_consumer_protocol_subscription(&subscription, &mut metadata)?;
         let metadata = metadata.freeze();
