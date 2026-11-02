@@ -495,3 +495,118 @@ async fn a_fenced_producer_reports_fenced() {
     );
     successor.close().await.unwrap();
 }
+
+/// One round writing to many partitions registers them in one
+/// `AddPartitionsToTxn`: a round trip per partition, in series, is what caps a
+/// transaction's writer, however few records each partition takes.
+#[tokio::test]
+async fn enqueue_all_registers_every_partition_in_one_request() {
+    let broker = FakeBroker::start().await.unwrap();
+    broker.create_topic("facts", 24);
+    broker.create_topic("hints", 24);
+    let producer = txn_producer(&broker, "txn-one-registration").await;
+
+    producer.begin().unwrap();
+    let records = (0..240)
+        .map(|n| {
+            let topic = if n % 2 == 0 { "facts" } else { "hints" };
+            Record::new(topic, format!("value-{n}")).key(format!("key-{n}"))
+        })
+        .collect();
+    broker.clear_requests();
+    let handles = producer.enqueue_all(records).await.unwrap();
+    assert_eq!(broker.request_count(ApiKey::AddPartitionsToTxn), 1);
+    for handle in handles {
+        let _ = handle.await.unwrap();
+    }
+    producer.commit().await.unwrap();
+
+    // The registration is the transaction's own: the next one registers again.
+    producer.begin().unwrap();
+    drop(
+        producer
+            .enqueue_all(vec![Record::new("facts", "a").key("k")])
+            .await
+            .unwrap(),
+    );
+    assert_eq!(broker.request_count(ApiKey::AddPartitionsToTxn), 2);
+    // A partition already registered in this transaction costs nothing.
+    drop(
+        producer
+            .enqueue_all(vec![Record::new("facts", "b").key("k")])
+            .await
+            .unwrap(),
+    );
+    assert_eq!(broker.request_count(ApiKey::AddPartitionsToTxn), 2);
+    producer.commit().await.unwrap();
+}
+
+/// The cost `enqueue_all` removes: `enqueue` of each record registers each new
+/// partition in a request of its own.
+#[tokio::test]
+async fn enqueue_one_by_one_registers_each_partition_in_its_own_request() {
+    let broker = FakeBroker::start().await.unwrap();
+    broker.create_topic("facts", 4);
+    let producer = txn_producer(&broker, "txn-serial-registration").await;
+    producer.begin().unwrap();
+    broker.clear_requests();
+    for partition in 0..4 {
+        drop(
+            producer
+                .enqueue(Record::new("facts", "v").partition(partition))
+                .await
+                .unwrap(),
+        );
+    }
+    assert_eq!(broker.request_count(ApiKey::AddPartitionsToTxn), 4);
+    producer.commit().await.unwrap();
+}
+
+/// Under TV2 the `Produce` requests register: `enqueue_all` sends no
+/// `AddPartitionsToTxn` and routes each record as `enqueue` does.
+#[tokio::test]
+async fn enqueue_all_under_tv2_sends_no_registration() {
+    let broker = broker(2).await;
+    let producer = txn_producer(&broker, "txn-tv2-registration").await;
+    producer.begin().unwrap();
+    let handles = producer
+        .enqueue_all(vec![rec("a"), rec("b")])
+        .await
+        .unwrap();
+    for handle in handles {
+        let _ = handle.await.unwrap();
+    }
+    producer.commit().await.unwrap();
+    assert_eq!(broker.request_count(ApiKey::AddPartitionsToTxn), 0);
+    assert_eq!(committed_values(&broker, "orders").len(), 2);
+}
+
+/// A refused registration queues nothing and leaves the transaction to abort;
+/// the next one registers and commits.
+#[tokio::test]
+async fn enqueue_all_refused_registration_queues_nothing() {
+    let broker = FakeBroker::start().await.unwrap();
+    broker.create_topic("facts", 8);
+    let producer = txn_producer(&broker, "txn-refused-registration").await;
+
+    producer.begin().unwrap();
+    broker.on_once(ApiKey::AddPartitionsToTxn, |_| {
+        Control::Error(ErrorCode::TopicAuthorizationFailed)
+    });
+    let records = (0..16)
+        .map(|n| Record::new("facts", "v").key(format!("key-{n}")))
+        .collect();
+    producer.enqueue_all(records).await.unwrap_err();
+    assert_eq!(broker.next_offset("facts", 0), Some(0));
+    producer.abort().await.unwrap();
+
+    producer.begin().unwrap();
+    let handles = producer
+        .enqueue_all(vec![Record::new("facts", "v").key("k")])
+        .await
+        .unwrap();
+    for handle in handles {
+        let _ = handle.await.unwrap();
+    }
+    producer.commit().await.unwrap();
+}

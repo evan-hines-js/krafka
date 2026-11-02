@@ -472,6 +472,13 @@ impl TopicPartitionOffset {
     }
 }
 
+/// A partition a transaction writes to.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct TxnPartition {
+    topic: TopicHandle,
+    partition: PartitionId,
+}
+
 /// State of a partition within the current transaction.
 #[derive(Debug, Clone)]
 enum PartitionAddState {
@@ -573,6 +580,14 @@ impl TransactionPartitions {
         notify.notify_waiters();
     }
 
+    /// Whether the coordinator confirmed any partition of the transaction.
+    fn any_added(&self) -> bool {
+        self.partitions
+            .values()
+            .flat_map(|partitions| partitions.values())
+            .any(|state| matches!(state, PartitionAddState::Added))
+    }
+
     fn clear(&mut self) {
         self.partitions.clear();
     }
@@ -601,30 +616,30 @@ struct PendingAddGuard {
 
 impl PendingAddGuard {
     /// Confirm the add succeeded. Consumes the guard without cancelling.
-    async fn confirm(mut self, topic: &str, partition: PartitionId) {
+    async fn confirm(mut self) {
         self.defused = true;
         let mut txn_partitions = self.txn_partitions.write().await;
-        txn_partitions.confirm_add(topic, partition, &self.notify);
+        txn_partitions.confirm_add(&self.topic, self.partition, &self.notify);
     }
 
     /// Explicitly cancel the add after a **retriable** error.
     ///
     /// Removes the partition entry so that concurrent waiters can retry the
     /// RPC on the next loop iteration.
-    async fn cancel(mut self, topic: &str, partition: PartitionId) {
+    async fn cancel(mut self) {
         self.defused = true;
         let mut txn_partitions = self.txn_partitions.write().await;
-        txn_partitions.cancel_add(topic, partition, &self.notify);
+        txn_partitions.cancel_add(&self.topic, self.partition, &self.notify);
     }
 
     /// Record a **non-retriable** failure for this partition.
     ///
     /// Stores a `Failed` sentinel so that concurrent waiters receive the
     /// error immediately instead of making an extra RPC that will also fail.
-    async fn fail(mut self, topic: &str, partition: PartitionId, error: Arc<KrafkaError>) {
+    async fn fail(mut self, error: Arc<KrafkaError>) {
         self.defused = true;
         let mut txn_partitions = self.txn_partitions.write().await;
-        txn_partitions.fail_add(topic, partition, error, &self.notify);
+        txn_partitions.fail_add(&self.topic, self.partition, error, &self.notify);
     }
 }
 
@@ -1329,7 +1344,8 @@ impl TransactionalProducer {
                 // explicit AddPartitionsToTxn, which must precede the write.
                 // TV2: the Produce request registers it (KIP-890).
                 if explicit {
-                    self.add_partition_to_txn_if_needed(&topic, partition).await
+                    self.register_partitions(&[TxnPartition { topic, partition }])
+                        .await
                 } else {
                     Ok(())
                 }
@@ -1337,6 +1353,72 @@ impl TransactionalProducer {
             move || gate.admit().map(Some),
         )
         .await
+    }
+
+    /// Queue `records` into the current transaction, in order, and return as
+    /// soon as they are all **queued**: [`enqueue`](Self::enqueue) of each,
+    /// with every partition they route to registered first in one
+    /// `AddPartitionsToTxn` (TV1). Enqueuing them one by one costs one
+    /// coordinator round trip, in series, per partition.
+    ///
+    /// Each record is routed here, once: it is sent to the partition chosen
+    /// here. An interceptor that moves a record to another topic or partition
+    /// costs that record its own registration, as with `enqueue`.
+    ///
+    /// # Cancel safety
+    ///
+    /// This method is not cancel safe. Dropped while queuing, the records
+    /// already queued stay in the transaction and their handles are lost.
+    ///
+    /// # Errors
+    ///
+    /// Refused unless a transaction is open and nothing in it has failed;
+    /// fails if a record cannot be routed or a partition cannot be registered,
+    /// queuing nothing. Past that, as `enqueue`: the first refused record ends
+    /// the call, and those queued before it stay in the transaction.
+    pub async fn enqueue_all(&self, mut records: Vec<Record>) -> Result<Vec<DeliveryHandle>> {
+        if let Err(error) = self.register_routes(&mut records).await {
+            for record in records {
+                self.refuse_send(record, error.clone());
+            }
+            return Err(error);
+        }
+        let mut handles = Vec::with_capacity(records.len());
+        for record in records {
+            handles.push(self.enqueue(record).await?);
+        }
+        Ok(handles)
+    }
+
+    /// Route every record, fixing its partition, and register the partitions
+    /// the records route to (TV1; under TV2 the `Produce` requests do, and
+    /// each record is routed when it is sent).
+    async fn register_routes(&self, records: &mut [Record]) -> Result<()> {
+        self.gate.check_open("send")?;
+        self.ensure_reinitialised().await?;
+        if !self.requires_explicit_partition_registration() {
+            return Ok(());
+        }
+        let started_at = tokio::time::Instant::now();
+        let max_block = self.producer.config.max_block;
+        let mut partitions = std::collections::HashSet::new();
+        for record in records.iter_mut() {
+            let topic = TopicHandle::from(record.topic.as_str());
+            let partition = super::resolve_partition(
+                self.metadata(),
+                &self.producer.partitioning,
+                &topic,
+                record.key.as_deref(),
+                record.partition,
+                record.estimated_size(),
+                max_block.saturating_sub(started_at.elapsed()),
+            )
+            .await?;
+            record.partition = Some(partition);
+            partitions.insert(TxnPartition { topic, partition });
+        }
+        let partitions: Vec<TxnPartition> = partitions.into_iter().collect();
+        self.register_partitions(&partitions).await
     }
 
     /// Report a send refused before it reached the shared send path to the
@@ -1352,59 +1434,70 @@ impl TransactionalProducer {
         }
     }
 
-    /// Ensure a partition is registered with the transaction coordinator,
-    /// issuing `AddPartitionsToTxn` at most once per partition per transaction
-    /// (TV1).
-    async fn add_partition_to_txn_if_needed(
-        &self,
-        topic: &Arc<str>,
-        partition: PartitionId,
-    ) -> Result<()> {
+    /// Ensure `partitions` are registered with the transaction coordinator:
+    /// those not yet registered in one `AddPartitionsToTxn`, each at most once
+    /// per transaction (TV1).
+    async fn register_partitions(&self, partitions: &[TxnPartition]) -> Result<()> {
         loop {
+            // Before the lock: dropped after it, on an early return, the
+            // guards find it free.
+            let mut adding = Vec::new();
+            let mut in_flight = None;
             let mut txn_partitions = self.txn_partitions.write().await;
-            match txn_partitions.begin_add(topic.as_ref(), partition) {
-                BeginAddResult::AlreadyAdded => break,
-                BeginAddResult::Fatal(err) => return Err((*err).clone()),
-                BeginAddResult::Wait(notify) => {
-                    // Register interest before releasing the lock so the
-                    // add's completion cannot be missed.
-                    let notified = notify.notified();
-                    tokio::pin!(notified);
-                    notified.as_mut().enable();
-                    drop(txn_partitions);
-                    notified.await;
-                }
-                BeginAddResult::NeedAdd(notify) => {
-                    drop(txn_partitions);
-                    let guard = PendingAddGuard {
+            for wanted in partitions {
+                match txn_partitions.begin_add(wanted.topic.as_ref(), wanted.partition) {
+                    BeginAddResult::AlreadyAdded => {}
+                    BeginAddResult::Fatal(err) => return Err((*err).clone()),
+                    BeginAddResult::Wait(notify) => in_flight = Some(notify),
+                    BeginAddResult::NeedAdd(notify) => adding.push(PendingAddGuard {
                         txn_partitions: self.txn_partitions.clone(),
-                        topic: topic.clone(),
-                        partition,
+                        topic: wanted.topic.clone(),
+                        partition: wanted.partition,
                         notify,
                         defused: false,
-                    };
-                    match self.add_partition_to_txn(topic.as_ref(), partition).await {
-                        Ok(()) => guard.confirm(topic.as_ref(), partition).await,
-                        Err(e) if e.is_retriable() => {
-                            guard.cancel(topic.as_ref(), partition).await;
-                            return Err(e);
-                        }
-                        Err(e) => {
-                            guard
-                                .fail(topic.as_ref(), partition, Arc::new(e.clone()))
-                                .await;
-                            return Err(e);
-                        }
-                    }
-                    break;
+                    }),
                 }
             }
+            if !adding.is_empty() {
+                drop(txn_partitions);
+                match self.add_partitions_to_txn(&adding).await {
+                    Ok(()) => {
+                        for guard in adding {
+                            guard.confirm().await;
+                        }
+                    }
+                    Err(e) if e.is_retriable() => {
+                        for guard in adding {
+                            guard.cancel().await;
+                        }
+                        return Err(e);
+                    }
+                    Err(e) => {
+                        let shared = Arc::new(e.clone());
+                        for guard in adding {
+                            guard.fail(Arc::clone(&shared)).await;
+                        }
+                        return Err(e);
+                    }
+                }
+                // Partitions another caller was registering are read again.
+                continue;
+            }
+            let Some(notify) = in_flight else {
+                return Ok(());
+            };
+            // Register interest before releasing the lock so the add's
+            // completion cannot be missed.
+            let notified = notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            drop(txn_partitions);
+            notified.await;
         }
-        Ok(())
     }
 
-    /// Add a partition to the current transaction (TV1).
-    async fn add_partition_to_txn(&self, topic: &str, partition: PartitionId) -> Result<()> {
+    /// Add `partitions` to the current transaction in one request (TV1).
+    async fn add_partitions_to_txn(&self, partitions: &[PendingAddGuard]) -> Result<()> {
         let result = self
             .with_coordinator("AddPartitionsToTxn", |attempt| async move {
                 let conn = self.coordinator_connection(attempt).await?;
@@ -1418,12 +1511,14 @@ impl TransactionalProducer {
                     .ok_or_else(|| {
                         KrafkaError::transactions_unsupported(ApiKey::AddPartitionsToTxn)
                     })?;
-                let request = AddPartitionsToTxnRequest::new(
-                    &self.transactional_id,
-                    producer_id,
-                    producer_epoch,
-                )
-                .add_partition(topic, partition);
+                let request = partitions.iter().fold(
+                    AddPartitionsToTxnRequest::new(
+                        &self.transactional_id,
+                        producer_id,
+                        producer_epoch,
+                    ),
+                    |request, added| request.add_partition(added.topic.as_ref(), added.partition),
+                );
                 let mut bytes = conn
                     .send_request(ApiKey::AddPartitionsToTxn, version, |buf| {
                         request.encode_versioned(version, buf)
@@ -1431,25 +1526,12 @@ impl TransactionalProducer {
                     .await?;
                 let response = AddPartitionsToTxnResponse::decode_versioned(version, &mut bytes)?;
                 if !response.is_ok() {
-                    for topic_result in &response.results {
-                        for partition_result in &topic_result.partitions {
-                            if !partition_result.error_code.is_ok() {
-                                return Err(KrafkaError::broker(
-                                    partition_result.error_code,
-                                    format!("failed to add {topic}-{partition} to transaction"),
-                                ));
-                            }
-                        }
-                    }
-                    return Err(KrafkaError::protocol_kind(
-                        ProtocolErrorKind::Malformed,
-                        format!(
-                            "failed to add {topic}-{partition} to transaction: the response \
-                             reported an error but no per-partition error"
-                        ),
-                    ));
+                    return Err(refused_partition(&response));
                 }
-                debug!("Added partition {}-{} to transaction", topic, partition);
+                debug!(
+                    partitions = partitions.len(),
+                    "Added partitions to transaction"
+                );
                 Ok(())
             })
             .await;
@@ -2136,6 +2218,21 @@ impl TransactionalProducer {
                 }
             })
             .await;
+        // A transaction whose every registration was refused never began at
+        // the coordinator: no partition of it is registered, and the
+        // coordinator refuses to end it. Abort has nothing to end.
+        if !commit
+            && matches!(
+                result,
+                Err(KrafkaError::Broker {
+                    code: ErrorCode::InvalidTxnState,
+                    ..
+                })
+            )
+            && !self.txn_partitions.read().await.any_added()
+        {
+            return Ok(());
+        }
         self.classify_transaction_result(result)
     }
 
@@ -2402,6 +2499,35 @@ fn build_txn_offset_commit_request(
         request = request.add_offset(&tpo.topic, tpo.partition, tpo.next_offset, None);
     }
     request
+}
+
+/// The error of an `AddPartitionsToTxn` that refused a partition: the
+/// partition's own refusal, not the `OperationNotAttempted` the coordinator
+/// answers for the partitions it left out because of that one.
+fn refused_partition(response: &AddPartitionsToTxnResponse) -> KrafkaError {
+    let refusals = || {
+        response.results.iter().flat_map(|topic| {
+            topic
+                .partitions
+                .iter()
+                .filter(|partition| !partition.error_code.is_ok())
+                .map(move |partition| (topic.name.as_str(), partition))
+        })
+    };
+    let refusal = refusals()
+        .find(|(_, partition)| partition.error_code != ErrorCode::OperationNotAttempted)
+        .or_else(|| refusals().next());
+    match refusal {
+        Some((topic, refused)) => KrafkaError::broker(
+            refused.error_code,
+            format!("failed to add {topic}-{} to transaction", refused.partition),
+        ),
+        None => KrafkaError::protocol_kind(
+            ProtocolErrorKind::Malformed,
+            "failed to add partitions to transaction: the response reported an error but no \
+             per-partition error",
+        ),
+    }
 }
 
 /// Whether an error code permanently fences the producer under `version`.
