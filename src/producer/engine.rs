@@ -1344,6 +1344,7 @@ async fn produce(
         }
     };
 
+    context.metrics.produce_requests.inc();
     if context.acks == 0 {
         let sent = connection
             .send_fire_and_forget(ApiKey::Produce, version, |buf| {

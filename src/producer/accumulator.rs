@@ -201,6 +201,11 @@ impl Accumulator {
         }
     }
 
+    /// The producer's recorder.
+    pub(crate) fn metrics(&self) -> &ProducerRecorder {
+        &self.metrics
+    }
+
     /// The error every send fails with once the producer cannot continue.
     pub(crate) fn fatal(&self) -> Option<KrafkaError> {
         self.shared.fatal()

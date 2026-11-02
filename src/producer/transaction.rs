@@ -1525,6 +1525,11 @@ impl TransactionalProducer {
                     ),
                     |request, added| request.add_partition(added.topic.as_ref(), added.partition),
                 );
+                self.producer
+                    .accumulator
+                    .metrics()
+                    .partition_registrations
+                    .inc();
                 let mut bytes = conn
                     .send_request(ApiKey::AddPartitionsToTxn, version, |buf| {
                         request.encode_versioned(version, buf)

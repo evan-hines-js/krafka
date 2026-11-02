@@ -103,6 +103,10 @@ pub struct ProducerMetrics {
     pub bytes_sent: u64,
     /// Batches the broker acknowledged.
     pub batches_sent: u64,
+    /// `Produce` requests sent.
+    pub produce_requests: u64,
+    /// `AddPartitionsToTxn` requests sent.
+    pub partition_registrations: u64,
     /// Batches that failed with a terminal error.
     pub errors: u64,
     /// Batch retries.
@@ -137,6 +141,8 @@ impl ProducerMetrics {
         self.records_sent += other.records_sent;
         self.bytes_sent += other.bytes_sent;
         self.batches_sent += other.batches_sent;
+        self.produce_requests += other.produce_requests;
+        self.partition_registrations += other.partition_registrations;
         self.errors += other.errors;
         self.retries += other.retries;
         self.data_loss_detected += other.data_loss_detected;
@@ -411,6 +417,22 @@ impl Metrics {
                 "batch.send.total",
                 "Batches the broker acknowledged.",
                 p.batches_sent,
+            ),
+            s(
+                Producer,
+                Counter,
+                "krafka_producer_produce_requests_total",
+                "produce.request.total",
+                "Produce requests sent.",
+                p.produce_requests,
+            ),
+            s(
+                Producer,
+                Counter,
+                "krafka_producer_partition_registrations_total",
+                "partition.registration.total",
+                "AddPartitionsToTxn requests sent.",
+                p.partition_registrations,
             ),
             s(
                 Producer,
@@ -1024,6 +1046,8 @@ pub(crate) struct ProducerRecorder {
     pub(crate) records_sent: Counter,
     pub(crate) bytes_sent: Counter,
     pub(crate) batches_sent: Counter,
+    pub(crate) produce_requests: Counter,
+    pub(crate) partition_registrations: Counter,
     pub(crate) errors: Counter,
     pub(crate) retries: Counter,
     pub(crate) data_loss_detected: Counter,
@@ -1048,6 +1072,8 @@ impl ProducerRecorder {
             records_sent: Counter::default(),
             bytes_sent: Counter::default(),
             batches_sent: Counter::default(),
+            produce_requests: Counter::default(),
+            partition_registrations: Counter::default(),
             errors: Counter::default(),
             retries: Counter::default(),
             data_loss_detected: Counter::default(),
@@ -1155,6 +1181,8 @@ impl ProducerRecorder {
             records_sent: self.records_sent.get(),
             bytes_sent: self.bytes_sent.get(),
             batches_sent: self.batches_sent.get(),
+            produce_requests: self.produce_requests.get(),
+            partition_registrations: self.partition_registrations.get(),
             errors: self.errors.get(),
             retries: self.retries.get(),
             data_loss_detected: self.data_loss_detected.get(),
