@@ -1492,13 +1492,13 @@ mod tests {
     }
 
     /// An error that requires an abort leaves the producer usable; a fatal
-    /// one does not. No error may claim both.
+    /// one does not. No error may be both.
     #[test]
     fn requires_abort_and_is_fatal_are_exclusive() {
         for (error, ..) in one_of_each() {
             assert!(
                 !(error.requires_abort() && error.is_fatal()),
-                "{error:?} claims both"
+                "{error:?} is both"
             );
         }
     }
