@@ -2058,10 +2058,11 @@ fn join_group(
     group.protocol_type = req.protocol_type.clone();
     group.protocol_name = protocol_name.clone();
     group.generation_id += 1;
-    // A single member is enough for the scenarios this harness targets, so each
-    // join replaces the membership rather than accumulating members. That also
-    // makes the joining member always the leader, which is what drives the
-    // client's own assignor.
+    // One client at a time is enough for the scenarios this harness targets, so
+    // each join replaces the membership rather than accumulating members; the
+    // rest of a group, if a test wants one, stands in it. That also makes the
+    // joining member always the leader, which is what drives the client's own
+    // assignor.
     group.members = vec![GroupMember {
         member_id: member_id.clone(),
         group_instance_id: req.group_instance_id.clone(),
@@ -2069,6 +2070,7 @@ fn join_group(
         client_id: client_id.unwrap_or_default().to_string(),
         client_host: "/127.0.0.1".to_string(),
     }];
+    group.members.extend(group.standing_members.iter().cloned());
     group.leader = member_id.clone();
     group.assignments.clear();
     group.state = ClassicGroupState::CompletingRebalance;

@@ -170,6 +170,10 @@ pub enum Control {
     Delay(Duration),
     /// Wait, then apply the nested control.
     DelayThen(Duration, Box<Control>),
+    /// Hold the request until the test notifies, then fall through to the
+    /// default handler: a coordinator holding a `JoinGroup` until the group's
+    /// last member rejoins, ended by the test instead of by a clock.
+    Hold(Arc<tokio::sync::Notify>),
     /// Drop the connection without answering.
     Disconnect,
     /// Never answer, but hold the connection open.
@@ -641,6 +645,27 @@ impl FakeBroker {
     /// Forget every recorded request.
     pub fn clear_requests(&self) {
         self.shared.log.lock().clear();
+    }
+
+    /// Stand `member_id` in `group`: every later classic round includes it
+    /// with `metadata` as its subscription, and the joining client, as leader,
+    /// assigns to it. It sends nothing and is asked nothing, which is what a
+    /// test wants of the rest of a group while it controls one real member.
+    pub fn stand_in_group(&self, group: &str, member_id: &str, metadata: Bytes) {
+        self.with_state(|state| {
+            state
+                .groups
+                .entry(group.to_string())
+                .or_default()
+                .standing_members
+                .push(GroupMember {
+                    member_id: member_id.to_string(),
+                    group_instance_id: None,
+                    metadata,
+                    client_id: member_id.to_string(),
+                    client_host: "/127.0.0.1".to_string(),
+                });
+        });
     }
 
     /// Wait until `api_key` has been seen at least `count` times, or the
@@ -1444,6 +1469,10 @@ async fn run_delays(mut control: Control) -> Control {
             Control::DelayThen(d, inner) => {
                 tokio::time::sleep(d).await;
                 control = *inner;
+            }
+            Control::Hold(released) => {
+                released.notified().await;
+                control = Control::Pass;
             }
             other => return other,
         }

@@ -6,3 +6,6 @@ mod listener;
 
 pub(super) use listener::ErasedRebalanceListener;
 pub use listener::{ConsumerRebalanceListener, NoOpRebalanceListener};
+
+#[cfg(all(test, feature = "test-broker"))]
+mod tests;

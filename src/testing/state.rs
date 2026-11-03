@@ -473,6 +473,9 @@ pub struct GroupState {
     pub leader: String,
     /// Current members.
     pub members: Vec<GroupMember>,
+    /// Members every round includes without their joining
+    /// ([`FakeBroker::stand_in_group`](super::FakeBroker::stand_in_group)).
+    pub standing_members: Vec<GroupMember>,
     /// Assignments distributed by SyncGroup, keyed by member ID.
     pub assignments: HashMap<String, Bytes>,
     /// Committed offsets, keyed by `(topic, partition)`.
