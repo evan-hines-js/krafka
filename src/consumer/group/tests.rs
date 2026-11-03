@@ -108,7 +108,7 @@ fn an_eager_member_subscribes_at_v0() {
 }
 
 /// Cooperative members report owned partitions and the generation they
-/// owned them in, so the leader can settle a double claim.
+/// owned them in, so the leader can settle a double report.
 #[test]
 fn a_cooperative_member_reports_owned_partitions_and_its_generation() {
     let c = coordinator(S::CooperativeSticky);
@@ -154,7 +154,7 @@ fn a_truncated_subscription_blob_is_an_error() {
 }
 
 /// A partition count far larger than the bytes behind it fails on the first
-/// missing byte instead of allocating for the claim.
+/// missing byte instead of allocating for the declared count.
 #[test]
 fn an_overcounted_partition_array_is_rejected_without_allocating_for_it() {
     let mut buf = BytesMut::new();
@@ -367,8 +367,7 @@ async fn a_join_outcome_is_parked_for_the_next_poll() {
 /// says by the time the round is applied: the member gave it up to a
 /// rebalance it has already applied, and only its rejoin brings the partition
 /// back. The leader withholds a partition from everyone until then, and the
-/// group reads Stable with the partition unowned (2026-11-02: fourteen of the
-/// claims-driver group's sixty, for good).
+/// group reads Stable with the partition unowned for good.
 #[test]
 fn a_round_that_leaves_out_a_reported_partition_owes_a_rejoin() {
     let mut reported = HashMap::new();

@@ -3,8 +3,8 @@
 //! possible.
 //!
 //! 1. Each member keeps the partitions it reported owning, if their topic
-//!    still exists and it still subscribes to it. A partition claimed by two
-//!    members goes to the claim with the higher generation.
+//!    still exists and it still subscribes to it. A partition reported by two
+//!    members goes to the report with the higher generation.
 //! 2. Every remaining partition goes to the subscribed member with the fewest
 //!    partitions.
 //! 3. While some member has at least two more partitions than another member
@@ -26,21 +26,21 @@ use crate::consumer::group::MemberAssignment;
 
 type TopicPartition = (String, PartitionId);
 
-/// The live owner of each claimed partition: the claim with the highest
+/// The live owner of each reported partition: the report with the highest
 /// generation, the first one on a tie.
-pub(super) fn resolve_claims(members: &[MemberSubscription]) -> HashMap<TopicPartition, usize> {
-    let mut claims: HashMap<TopicPartition, (usize, i32)> = HashMap::new();
+pub(super) fn resolve_owners(members: &[MemberSubscription]) -> HashMap<TopicPartition, usize> {
+    let mut owners: HashMap<TopicPartition, (usize, i32)> = HashMap::new();
     for (index, member) in members.iter().enumerate() {
         for tp in &member.owned {
-            match claims.get(tp) {
+            match owners.get(tp) {
                 Some(&(_, generation)) if generation >= member.generation => {}
                 _ => {
-                    claims.insert(tp.clone(), (index, member.generation));
+                    owners.insert(tp.clone(), (index, member.generation));
                 }
             }
         }
     }
-    claims
+    owners
         .into_iter()
         .map(|(tp, (index, _))| (tp, index))
         .collect()
@@ -63,8 +63,8 @@ pub(super) fn assign(
     let mut assigned: Vec<BTreeSet<TopicPartition>> = vec![BTreeSet::new(); members.len()];
     let mut owner: HashMap<TopicPartition, usize> = HashMap::new();
 
-    // 1. Sticky claims.
-    for (tp, index) in resolve_claims(members) {
+    // 1. Sticky owners.
+    for (tp, index) in resolve_owners(members) {
         if exists.contains(&tp) && members[index].subscribes(&tp.0) {
             assigned[index].insert(tp.clone());
             owner.insert(tp, index);

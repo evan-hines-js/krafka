@@ -134,7 +134,7 @@ pub(crate) fn withhold_transferring_partitions(
     assignments: &mut HashMap<String, MemberAssignment>,
     members: &[MemberSubscription],
 ) {
-    let previous_owner = sticky::resolve_claims(members);
+    let previous_owner = sticky::resolve_owners(members);
     for (member_id, assignment) in assignments.iter_mut() {
         assignment.partitions.retain(|topic, partitions| {
             partitions.retain(|&p| match previous_owner.get(&(topic.clone(), p)) {
