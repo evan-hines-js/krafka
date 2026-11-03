@@ -187,7 +187,7 @@ mod tests {
         assert!(barrier.is_closing(), "completing work does not reopen it");
     }
 
-    /// The `Debug` impl must render the counters it claims to.
+    /// The `Debug` impl must render the counters it reports.
     ///
     /// This is the type three shutdown paths block on (the transactional
     /// producer's commit and abort, and the share consumer's acknowledgement

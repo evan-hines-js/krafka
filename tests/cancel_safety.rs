@@ -1,4 +1,4 @@
-//! Every `# Cancel safety` claim on the data path, checked by dropping the
+//! Every `# Cancel safety` guarantee on the data path, checked by dropping the
 //! future at every point it can be dropped.
 //!
 //! Each case builds a fresh in-memory cluster under a paused clock, polls the

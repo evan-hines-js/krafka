@@ -455,7 +455,7 @@ pub fn check(
 
 /// What the application was told about one transaction.
 #[derive(Debug, PartialEq, Eq)]
-enum Claim {
+enum Verdict {
     Committed,
     /// Aborted, or a commit failed definitely with nothing indefinite.
     NotCommitted,
@@ -471,20 +471,20 @@ fn check_txn(
     committed: &HashSet<String>,
     push: &mut impl FnMut(Invariant, String),
 ) {
-    let mut claim = Claim::Open;
+    let mut verdict = Verdict::Open;
     for (_, op) in members {
         let outcome = op.completed.as_ref().map(|(_, o)| o);
-        claim = match (&op.kind, outcome, claim) {
-            (Kind::Commit { .. }, Some(Outcome::Ok), _) => Claim::Committed,
-            (_, _, Claim::Committed) => Claim::Committed,
+        verdict = match (&op.kind, outcome, verdict) {
+            (Kind::Commit { .. }, Some(Outcome::Ok), _) => Verdict::Committed,
+            (_, _, Verdict::Committed) => Verdict::Committed,
             (Kind::Commit { .. } | Kind::Abort { .. }, Some(Outcome::Unknown(_)), _) => {
-                Claim::Unknown
+                Verdict::Unknown
             }
-            (Kind::Commit { .. }, None, _) => Claim::Unknown,
-            (Kind::Abort { .. }, Some(Outcome::Ok), Claim::Unknown) => Claim::Unknown,
-            (Kind::Abort { .. }, Some(Outcome::Ok), _) => Claim::NotCommitted,
-            (Kind::Commit { .. }, Some(Outcome::Failed(_)), Claim::Open) => Claim::NotCommitted,
-            (_, _, claim) => claim,
+            (Kind::Commit { .. }, None, _) => Verdict::Unknown,
+            (Kind::Abort { .. }, Some(Outcome::Ok), Verdict::Unknown) => Verdict::Unknown,
+            (Kind::Abort { .. }, Some(Outcome::Ok), _) => Verdict::NotCommitted,
+            (Kind::Commit { .. }, Some(Outcome::Failed(_)), Verdict::Open) => Verdict::NotCommitted,
+            (_, _, verdict) => verdict,
         };
     }
 
@@ -500,8 +500,8 @@ fn check_txn(
         .filter(|(_, value, _)| committed.contains(*value))
         .collect();
 
-    match claim {
-        Claim::Committed => {
+    match verdict {
+        Verdict::Committed => {
             for (id, value, outcome) in &sends {
                 match outcome {
                     Some(Outcome::Ok) if committed.contains(*value) => {}
@@ -516,7 +516,7 @@ fn check_txn(
                 }
             }
         }
-        Claim::NotCommitted => {
+        Verdict::NotCommitted => {
             for (id, value, _) in &visible {
                 push(
                     Invariant::PartialCommit,
@@ -524,7 +524,7 @@ fn check_txn(
                 );
             }
         }
-        Claim::Unknown | Claim::Open => {
+        Verdict::Unknown | Verdict::Open => {
             if !visible.is_empty() && visible.len() != sends.len() {
                 push(
                     Invariant::PartialCommit,
