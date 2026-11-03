@@ -105,7 +105,7 @@ pub struct ConsumerProtocolSubscription {
     pub user_data: Option<Bytes>,
     /// Partitions the member reports still owning (v1+).
     ///
-    /// This is the member's *claim*, which is what cooperative rebalancing
+    /// This is what the member reports owning, which is what cooperative rebalancing
     /// needs in order to revoke before reassigning. It is not necessarily what
     /// the last assignment granted.
     pub owned_partitions: Vec<ConsumerProtocolTopicPartitions>,

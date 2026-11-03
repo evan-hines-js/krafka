@@ -163,7 +163,7 @@ fn the_same_input_gives_the_same_output() {
 }
 
 #[test]
-fn the_newer_generation_wins_a_double_claim() {
+fn the_newer_generation_wins_a_double_report() {
     let parts = partitions(&[("t", 2)]);
     let mut stale = MemberAssignment::empty();
     stale.add("t", vec![0]);
@@ -213,16 +213,15 @@ fn withholding_removes_only_partitions_moving_between_live_members() {
     assert_eq!(counts(&next, &["m1", "m2"]), vec![2, 2]);
 }
 
-/// The claims-driver group of 2026-11-02: ten members, sixty partitions, and
-/// one member whose join still reported the twenty it held when the join
+/// Ten members, sixty partitions, and one member whose join still reported the twenty it held when the join
 /// left, fourteen of which it had given up by the time the round ended. The
 /// round withholds those fourteen from everyone and hands out the rest, so
 /// only that member's `reported - assigned` can ever bring them back.
 #[test]
-fn a_stale_claim_withholds_what_only_its_claimant_can_bring_back() {
-    let mut claimed = MemberAssignment::empty();
-    claimed.add("t", (40..60).collect());
-    let mut members = vec![owning("m0", &["t"], &claimed, 26)];
+fn a_stale_report_withholds_what_only_its_reporter_can_bring_back() {
+    let mut owned = MemberAssignment::empty();
+    owned.add("t", (40..60).collect());
+    let mut members = vec![owning("m0", &["t"], &owned, 26)];
     for id in 1..10 {
         members.push(member(&format!("m{id}"), &["t"]));
     }
