@@ -33,7 +33,7 @@ enum Protocol {
 
 fn to_topic_partitions(keys: &[PartitionKey]) -> Vec<TopicPartition> {
     keys.iter()
-        .map(|(topic, partition)| TopicPartition::new(topic.clone(), *partition))
+        .map(|(topic, partition)| TopicPartition::new(topic.to_string(), *partition))
         .collect()
 }
 
@@ -192,7 +192,7 @@ impl Consumer {
     ) -> Result<()> {
         let new: HashSet<PartitionKey> = assignment
             .all_partitions()
-            .map(|(t, p)| (t.to_string(), p))
+            .map(|(t, p)| (std::sync::Arc::from(t), p))
             .collect();
         let (revoked, added) = {
             let state = self.state.lock();
@@ -332,8 +332,11 @@ impl Consumer {
                 return Ok(());
             }
             let topics: Vec<String> = state.standalone_topics.iter().cloned().collect();
-            let assigned_topics: HashSet<String> =
-                state.assigned_keys().into_iter().map(|(t, _)| t).collect();
+            let assigned_topics: HashSet<String> = state
+                .assigned_keys()
+                .into_iter()
+                .map(|(t, _)| t.to_string())
+                .collect();
             let due = force
                 || state.standalone_resolved.is_none_or(|at| {
                     at.elapsed() >= self.metadata.max_age()
@@ -354,15 +357,16 @@ impl Consumer {
         let mut desired: HashSet<PartitionKey> = HashSet::new();
         for topic in &topics {
             if let Some(info) = self.metadata.topic_arc(topic) {
-                desired.extend(info.partitions_iter().map(|p| (topic.clone(), p.partition)));
+                let name: std::sync::Arc<str> = std::sync::Arc::from(topic.as_str());
+                desired.extend(info.partitions_iter().map(|p| (name.clone(), p.partition)));
             }
         }
         let mut state = self.state.lock();
-        let topic_set: HashSet<&String> = topics.iter().collect();
+        let topic_set: HashSet<&str> = topics.iter().map(String::as_str).collect();
         let current: Vec<PartitionKey> = state
             .assigned_keys()
             .into_iter()
-            .filter(|(t, _)| topic_set.contains(t))
+            .filter(|(t, _)| topic_set.contains(&**t))
             .collect();
         let gone: Vec<PartitionKey> = current
             .iter()
@@ -411,7 +415,7 @@ impl Consumer {
     ) -> HashMap<String, Vec<PartitionId>> {
         let mut map: HashMap<String, Vec<PartitionId>> = HashMap::new();
         for (topic, partition) in keys {
-            map.entry(topic.clone()).or_default().push(*partition);
+            map.entry(topic.to_string()).or_default().push(*partition);
         }
         map
     }

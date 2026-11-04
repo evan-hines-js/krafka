@@ -18,8 +18,21 @@
 //! is empty, so the next fetch offset is always the buffered fetch's
 //! [`next_offset`](CompletedFetch::next_offset) or, with nothing buffered, the
 //! position.
+//!
+//! # Bookkeeping per change
+//!
+//! What the gauges report (paused, buffered, lag) and which partitions are
+//! waiting for a position, a reset or a validation are kept as a running
+//! [`Tally`]: every change to a partition's record recounts that one
+//! partition, so reading them costs nothing per poll however many partitions
+//! are assigned, and an idle poll that changes nothing counts nothing. The
+//! same recount notes the partitions whose fetch position moved, for
+//! [`SubscriptionState::take_moved`]. A partition's topic name is shared by
+//! every key of that topic (one allocation per topic, [`PartitionKey`]), so
+//! copying a key allocates nothing.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::Instant;
 
@@ -32,8 +45,9 @@ use super::record::{ConsumerRecord, TopicPartition};
 use crate::error::{KrafkaError, Result};
 use crate::{BrokerId, Offset, PartitionId};
 
-/// A `(topic, partition)` key.
-pub(super) type PartitionKey = (String, PartitionId);
+/// A `(topic, partition)` key. The topic's name is shared by every key of
+/// the topic the state holds, so a copy allocates nothing.
+pub(super) type PartitionKey = (Arc<str>, PartitionId);
 
 /// First wait after a failed or fenced attempt on a partition.
 const BACKOFF_INITIAL: Duration = Duration::from_millis(100);
@@ -133,6 +147,9 @@ pub(super) struct PartitionRecord {
     /// interval, after a failed offset lookup, a fenced fetch or a failed
     /// validation. Cleared by the first attempt that succeeds.
     pub(super) backoff: Option<(Instant, Duration)>,
+    /// What this partition contributes to the [`Tally`], as of its last
+    /// change.
+    counted: Counted,
 }
 
 impl PartitionRecord {
@@ -163,6 +180,104 @@ impl PartitionRecord {
         let position = self.position?;
         Some((end - position).max(0) as u64)
     }
+
+    fn buffered_records(&self) -> usize {
+        self.buffered
+            .as_ref()
+            .map_or(0, |fetch| fetch.records.len())
+    }
+}
+
+/// What one partition's record contributes to the [`Tally`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Counted {
+    paused: bool,
+    buffered: usize,
+    /// Unpaused, not delivering, with records buffered.
+    deliverable: bool,
+    lag: Option<u64>,
+    /// Neither a position nor a pending reset.
+    needs_position: bool,
+    awaiting_reset: bool,
+    /// Positioned, unpaused and not validated.
+    unvalidated: bool,
+    fetch_position: Option<Offset>,
+}
+
+impl Counted {
+    fn of(record: &PartitionRecord, isolation_level: IsolationLevel) -> Self {
+        let buffered = record.buffered_records();
+        Self {
+            paused: record.paused,
+            buffered,
+            deliverable: !record.paused && !record.delivering && buffered > 0,
+            lag: record.lag(isolation_level),
+            needs_position: record.position.is_none() && record.reset.is_none(),
+            awaiting_reset: record.reset.is_some(),
+            unvalidated: !record.validated && !record.paused && record.position.is_some(),
+            fetch_position: record.fetch_position(),
+        }
+    }
+}
+
+/// The sums of every assigned partition's [`Counted`].
+#[derive(Debug, Default)]
+struct Tally {
+    paused: usize,
+    buffered: usize,
+    deliverable: usize,
+    needs_position: usize,
+    awaiting_reset: usize,
+    unvalidated: usize,
+    /// Total lag of the partitions whose lag is known; wide enough that no
+    /// sum of `u64` lags overflows it.
+    lag: u128,
+    /// How many partitions have each known lag: the largest is the last.
+    lags: BTreeMap<u64, usize>,
+}
+
+impl Tally {
+    fn add(&mut self, counted: &Counted) {
+        self.paused += usize::from(counted.paused);
+        self.buffered += counted.buffered;
+        self.deliverable += usize::from(counted.deliverable);
+        self.needs_position += usize::from(counted.needs_position);
+        self.awaiting_reset += usize::from(counted.awaiting_reset);
+        self.unvalidated += usize::from(counted.unvalidated);
+        if let Some(lag) = counted.lag {
+            self.lag += u128::from(lag);
+            *self.lags.entry(lag).or_default() += 1;
+        }
+    }
+
+    fn remove(&mut self, counted: &Counted) {
+        self.paused -= usize::from(counted.paused);
+        self.buffered -= counted.buffered;
+        self.deliverable -= usize::from(counted.deliverable);
+        self.needs_position -= usize::from(counted.needs_position);
+        self.awaiting_reset -= usize::from(counted.awaiting_reset);
+        self.unvalidated -= usize::from(counted.unvalidated);
+        if let Some(lag) = counted.lag {
+            self.lag -= u128::from(lag);
+            if let std::collections::btree_map::Entry::Occupied(mut entry) = self.lags.entry(lag) {
+                *entry.get_mut() -= 1;
+                if *entry.get() == 0 {
+                    entry.remove();
+                }
+            }
+        }
+    }
+}
+
+/// A partition whose fetch position moved, as [`SubscriptionState::take_moved`]
+/// reports it.
+#[derive(Debug, Clone)]
+pub(super) struct MovedPartition {
+    pub(super) key: PartitionKey,
+    /// Where its next fetch starts now.
+    pub(super) fetch_position: Option<Offset>,
+    /// Its cached readable end offset.
+    pub(super) readable_end: Option<Offset>,
 }
 
 /// A partition about to be fetched, captured with the version the response
@@ -177,6 +292,9 @@ pub(super) struct FetchTarget {
     pub(super) last_fetched_epoch: i32,
     /// A live KIP-392 preferred replica, if any.
     pub(super) preferred_replica: Option<BrokerId>,
+    /// The leader epoch the metadata cache knows, sent as
+    /// `current_leader_epoch` (KIP-320); `-1` until the fetch is routed.
+    pub(super) leader_epoch: i32,
 }
 
 /// A partition whose position has to be (re)established.
@@ -214,8 +332,16 @@ pub(super) struct SubscriptionState {
     pub(super) standalone_topics: HashSet<String>,
     /// When the group-less subscription was last resolved.
     pub(super) standalone_resolved: Option<Instant>,
-    /// Assigned partitions; the key set is the assignment.
+    /// Assigned partitions; the key set is the assignment. Every record's
+    /// change goes through [`Self::recount`].
     partitions: BTreeMap<PartitionKey, PartitionRecord>,
+    /// The one shared name of every topic a key was made for.
+    names: HashSet<Arc<str>>,
+    /// The lag every partition counts is read under this level.
+    isolation_level: IsolationLevel,
+    tally: Tally,
+    /// Partitions whose fetch position moved since [`Self::take_moved`].
+    moved: BTreeSet<PartitionKey>,
     next_version: u64,
     /// KIP-227 fetch sessions, one per broker.
     pub(super) fetch_sessions: FetchSessionCache,
@@ -227,20 +353,29 @@ pub(super) struct SubscriptionState {
 
 impl Default for SubscriptionState {
     fn default() -> Self {
+        Self::new(IsolationLevel::default())
+    }
+}
+
+impl SubscriptionState {
+    /// An empty state whose lag is read under `isolation_level`.
+    pub(super) fn new(isolation_level: IsolationLevel) -> Self {
         Self {
             subscription: HashSet::new(),
             standalone_topics: HashSet::new(),
             standalone_resolved: None,
             partitions: BTreeMap::new(),
+            names: HashSet::new(),
+            isolation_level,
+            tally: Tally::default(),
+            moved: BTreeSet::new(),
             next_version: 0,
             fetch_sessions: FetchSessionCache::new(),
             rotation: 0,
             last_auto_commit: Instant::now(),
         }
     }
-}
 
-impl SubscriptionState {
     fn bump(&mut self) -> u64 {
         self.next_version += 1;
         self.next_version
@@ -252,13 +387,75 @@ impl SubscriptionState {
         ))
     }
 
+    /// The key of `topic`'s `partition`: its topic's shared name when the
+    /// state knows the topic, so no allocation.
+    pub(super) fn key(&self, topic: &str, partition: PartitionId) -> PartitionKey {
+        (self.topic(topic), partition)
+    }
+
+    /// `topic`'s shared name, or a new one for a topic never assigned.
+    pub(super) fn topic(&self, topic: &str) -> Arc<str> {
+        self.names
+            .get(topic)
+            .cloned()
+            .unwrap_or_else(|| Arc::from(topic))
+    }
+
+    fn intern(&mut self, topic: &Arc<str>) -> Arc<str> {
+        if let Some(name) = self.names.get(&**topic) {
+            return name.clone();
+        }
+        self.names.insert(topic.clone());
+        topic.clone()
+    }
+
+    /// Bring the [`Tally`] and the moved partitions up to date with one
+    /// changed record.
+    fn recount(
+        tally: &mut Tally,
+        moved: &mut BTreeSet<PartitionKey>,
+        isolation_level: IsolationLevel,
+        key: &PartitionKey,
+        record: &mut PartitionRecord,
+    ) {
+        let now = Counted::of(record, isolation_level);
+        let was = record.counted;
+        if now == was {
+            return;
+        }
+        tally.remove(&was);
+        tally.add(&now);
+        if now.fetch_position != was.fetch_position && !moved.contains(key) {
+            moved.insert(key.clone());
+        }
+        record.counted = now;
+    }
+
+    /// Change an assigned partition's record, recounting it.
+    fn update<R>(
+        &mut self,
+        key: &PartitionKey,
+        change: impl FnOnce(&mut PartitionRecord) -> R,
+    ) -> Option<R> {
+        let record = self.partitions.get_mut(key)?;
+        let out = change(record);
+        Self::recount(
+            &mut self.tally,
+            &mut self.moved,
+            self.isolation_level,
+            key,
+            record,
+        );
+        Some(out)
+    }
+
     // ── assignment ──────────────────────────────────────────────────────
 
     /// The current assignment, partitions sorted.
     pub(super) fn assignment(&self) -> HashMap<String, Vec<PartitionId>> {
         let mut out: HashMap<String, Vec<PartitionId>> = HashMap::new();
         for (topic, partition) in self.partitions.keys() {
-            out.entry(topic.clone()).or_default().push(*partition);
+            out.entry(topic.to_string()).or_default().push(*partition);
         }
         out
     }
@@ -283,18 +480,24 @@ impl SubscriptionState {
     /// Add partitions with no position. Already assigned partitions keep
     /// their state.
     pub(super) fn add_partitions(&mut self, keys: impl IntoIterator<Item = PartitionKey>) {
-        for key in keys {
+        for (topic, partition) in keys {
+            let key = (self.intern(&topic), partition);
             if self.partitions.contains_key(&key) {
                 continue;
             }
             let version = self.bump();
-            self.partitions.insert(
-                key,
-                PartitionRecord {
-                    version,
-                    ..PartitionRecord::default()
-                },
+            let mut record = PartitionRecord {
+                version,
+                ..PartitionRecord::default()
+            };
+            Self::recount(
+                &mut self.tally,
+                &mut self.moved,
+                self.isolation_level,
+                &key,
+                &mut record,
             );
+            self.partitions.insert(key, record);
         }
     }
 
@@ -305,13 +508,18 @@ impl SubscriptionState {
         keys: impl IntoIterator<Item = &'a PartitionKey>,
     ) {
         for key in keys {
-            self.partitions.remove(key);
+            if let Some(record) = self.partitions.remove(key) {
+                self.tally.remove(&record.counted);
+            }
+            self.moved.remove(key);
         }
     }
 
     /// Drop every partition.
     pub(super) fn clear_assignment(&mut self) {
         self.partitions.clear();
+        self.tally = Tally::default();
+        self.moved.clear();
     }
 
     // ── positions ───────────────────────────────────────────────────────
@@ -323,7 +531,7 @@ impl SubscriptionState {
             return Err(Self::not_assigned(&key.0, key.1));
         }
         let version = self.bump();
-        if let Some(record) = self.partitions.get_mut(key) {
+        self.update(key, |record| {
             record.version = version;
             record.position = Some(offset);
             record.epoch = None;
@@ -332,7 +540,7 @@ impl SubscriptionState {
             record.buffered = None;
             record.delivering = false;
             record.backoff = None;
-        }
+        });
         Ok(())
     }
 
@@ -343,7 +551,7 @@ impl SubscriptionState {
             return Err(Self::not_assigned(&key.0, key.1));
         }
         let version = self.bump();
-        if let Some(record) = self.partitions.get_mut(key) {
+        self.update(key, |record| {
             record.version = version;
             record.position = None;
             record.epoch = None;
@@ -352,7 +560,7 @@ impl SubscriptionState {
             record.buffered = None;
             record.delivering = false;
             record.backoff = None;
-        }
+        });
         Ok(())
     }
 
@@ -377,6 +585,9 @@ impl SubscriptionState {
     /// not backing off: newly assigned ones waiting for their committed
     /// offset.
     pub(super) fn partitions_needing_position(&self, now: Instant) -> Vec<PendingPosition> {
+        if self.tally.needs_position == 0 {
+            return Vec::new();
+        }
         self.partitions
             .iter()
             .filter(|(_, r)| r.position.is_none() && r.reset.is_none() && r.backoff_elapsed(now))
@@ -392,6 +603,9 @@ impl SubscriptionState {
         &self,
         now: Instant,
     ) -> Vec<(PendingPosition, OffsetReset)> {
+        if self.tally.awaiting_reset == 0 {
+            return Vec::new();
+        }
         self.partitions
             .iter()
             .filter(|(_, r)| r.backoff_elapsed(now))
@@ -418,17 +632,18 @@ impl SubscriptionState {
         offset: Offset,
         epoch: Option<i32>,
     ) -> bool {
-        match self.partitions.get_mut(key) {
-            Some(r) if r.version == version && r.position.is_none() => {
-                r.position = Some(offset);
-                r.epoch = epoch;
-                r.reset = None;
-                r.validated = false;
-                r.backoff = None;
-                true
+        self.update(key, |r| {
+            if r.version != version || r.position.is_some() {
+                return false;
             }
-            _ => false,
-        }
+            r.position = Some(offset);
+            r.epoch = epoch;
+            r.reset = None;
+            r.validated = false;
+            r.backoff = None;
+            true
+        })
+        .unwrap_or(false)
     }
 
     /// Record that a partition without a committed offset falls back to
@@ -439,23 +654,22 @@ impl SubscriptionState {
         version: u64,
         reset: OffsetReset,
     ) {
-        if let Some(r) = self.partitions.get_mut(key)
-            && r.version == version
-            && r.position.is_none()
-        {
-            r.reset = Some(reset);
-        }
+        self.update(key, |r| {
+            if r.version == version && r.position.is_none() {
+                r.reset = Some(reset);
+            }
+        });
     }
 
     /// Back off a partition after a failed attempt (100 ms doubling to 30 s).
     pub(super) fn back_off(&mut self, key: &PartitionKey, version: Option<u64>, now: Instant) {
-        if let Some(r) = self.partitions.get_mut(key)
-            && version.is_none_or(|v| v == r.version)
-        {
-            let previous = r.backoff.map(|(_, d)| d).unwrap_or(Duration::ZERO);
-            let next = (previous * 2).clamp(BACKOFF_INITIAL, BACKOFF_MAX);
-            r.backoff = Some((now + next, next));
-        }
+        self.update(key, |r| {
+            if version.is_none_or(|v| v == r.version) {
+                let previous = r.backoff.map(|(_, d)| d).unwrap_or(Duration::ZERO);
+                let next = (previous * 2).clamp(BACKOFF_INITIAL, BACKOFF_MAX);
+                r.backoff = Some((now + next, next));
+            }
+        });
     }
 
     /// Rewind a partition to `end_offset` after the broker reported that its
@@ -472,31 +686,30 @@ impl SubscriptionState {
         }
         let old = current.position;
         let new_version = self.bump();
-        let r = self.partitions.get_mut(key)?;
-        r.version = new_version;
-        r.position = Some(end_offset);
-        r.epoch = None;
-        r.reset = None;
-        r.validated = true;
-        r.buffered = None;
-        r.delivering = false;
+        self.update(key, |r| {
+            r.version = new_version;
+            r.position = Some(end_offset);
+            r.epoch = None;
+            r.reset = None;
+            r.validated = true;
+            r.buffered = None;
+            r.delivering = false;
+        })?;
         old
     }
 
     /// Mark a validated position.
     pub(super) fn mark_validated(&mut self, key: &PartitionKey, version: u64) {
-        if let Some(r) = self.partitions.get_mut(key)
-            && r.version == version
-        {
-            r.validated = true;
-        }
+        self.update(key, |r| {
+            if r.version == version {
+                r.validated = true;
+            }
+        });
     }
 
     /// Mark a position as needing validation, e.g. after a fenced fetch.
     pub(super) fn mark_unvalidated(&mut self, key: &PartitionKey) {
-        if let Some(r) = self.partitions.get_mut(key) {
-            r.validated = false;
-        }
+        self.update(key, |r| r.validated = false);
     }
 
     /// Positioned partitions whose position has not been validated, with the
@@ -505,6 +718,9 @@ impl SubscriptionState {
         &self,
         now: Instant,
     ) -> Vec<(PartitionKey, u64, Offset, Option<i32>)> {
+        if self.tally.unvalidated == 0 {
+            return Vec::new();
+        }
         self.partitions
             .iter()
             .filter(|(_, r)| !r.validated && !r.paused && r.backoff_elapsed(now))
@@ -522,40 +738,44 @@ impl SubscriptionState {
         partitions: &[PartitionId],
         paused: bool,
     ) -> usize {
+        let topic = self.topic(topic);
         let mut applied = 0;
         for &partition in partitions {
-            if let Some(r) = self.partitions.get_mut(&(topic.to_string(), partition)) {
-                r.paused = paused;
+            if self
+                .update(&(topic.clone(), partition), |r| r.paused = paused)
+                .is_some()
+            {
                 applied += 1;
             }
         }
         applied
     }
 
-    pub(super) fn paused(&self) -> HashSet<PartitionKey> {
+    /// The paused partitions, built for the caller who asks: the gauge reads
+    /// [`Self::paused_count`].
+    pub(super) fn paused(&self) -> HashSet<(String, PartitionId)> {
         self.partitions
             .iter()
             .filter(|(_, r)| r.paused)
-            .map(|(key, _)| key.clone())
+            .map(|((topic, partition), _)| (topic.to_string(), *partition))
             .collect()
+    }
+
+    /// How many assigned partitions are paused.
+    pub(super) fn paused_count(&self) -> usize {
+        self.tally.paused
     }
 
     // ── fetching ────────────────────────────────────────────────────────
 
     /// Number of fetched records not handed out yet.
     pub(super) fn buffered_count(&self) -> usize {
-        self.partitions
-            .values()
-            .filter_map(|r| r.buffered.as_ref())
-            .map(|f| f.records.len())
-            .sum()
+        self.tally.buffered
     }
 
     /// Whether any unpaused partition has records ready to hand out.
     pub(super) fn has_deliverable(&self) -> bool {
-        self.partitions.values().any(|r| {
-            !r.paused && !r.delivering && r.buffered.as_ref().is_some_and(|f| !f.records.is_empty())
-        })
+        self.tally.deliverable > 0
     }
 
     /// The partitions a fetch may be issued for, rotated by one per call so
@@ -565,7 +785,14 @@ impl SubscriptionState {
     /// A partition is fetchable when it is positioned, unpaused, not backing
     /// off, and has nothing buffered or in delivery.
     pub(super) fn fetch_targets(&mut self, now: Instant) -> Vec<FetchTarget> {
-        let mut targets: Vec<FetchTarget> = Vec::new();
+        let unpaused = self.partitions.len() - self.tally.paused;
+        if unpaused == 0 {
+            // A consumer whose every partition is paused (a group member
+            // whose records others fetch) fetches nothing, and nothing is
+            // scanned to find that out.
+            return Vec::new();
+        }
+        let mut targets: Vec<FetchTarget> = Vec::with_capacity(unpaused);
         for (key, r) in self.partitions.iter_mut() {
             if let Some((_, expiry)) = r.preferred_replica
                 && now >= expiry
@@ -587,6 +814,7 @@ impl SubscriptionState {
                 offset,
                 last_fetched_epoch: r.epoch.unwrap_or(-1),
                 preferred_replica: r.preferred_replica.map(|(id, _)| id),
+                leader_epoch: -1,
             });
         }
         if !targets.is_empty() {
@@ -602,37 +830,37 @@ impl SubscriptionState {
     /// batches, compaction gaps) moves the position directly. Returns whether
     /// it was applied.
     pub(super) fn install_fetch(&mut self, target: &FetchTarget, fetch: CompletedFetch) -> bool {
-        let Some(r) = self.partitions.get_mut(&target.key) else {
-            return false;
-        };
-        if r.version != target.version
-            || r.position != Some(target.offset)
-            || r.buffered.is_some()
-            || r.delivering
-        {
-            return false;
-        }
-        r.backoff = None;
-        if fetch.records.is_empty() {
-            if fetch.next_offset > target.offset {
-                r.position = Some(fetch.next_offset);
-                if fetch.next_epoch.is_some() {
-                    r.epoch = fetch.next_epoch;
-                }
+        self.update(&target.key, |r| {
+            if r.version != target.version
+                || r.position != Some(target.offset)
+                || r.buffered.is_some()
+                || r.delivering
+            {
+                return false;
             }
-        } else {
-            r.buffered = Some(fetch);
-        }
-        true
+            r.backoff = None;
+            if fetch.records.is_empty() {
+                if fetch.next_offset > target.offset {
+                    r.position = Some(fetch.next_offset);
+                    if fetch.next_epoch.is_some() {
+                        r.epoch = fetch.next_epoch;
+                    }
+                }
+            } else {
+                r.buffered = Some(fetch);
+            }
+            true
+        })
+        .unwrap_or(false)
     }
 
     /// Clear a partition's backoff after an unfenced fetch.
     pub(super) fn clear_backoff(&mut self, key: &PartitionKey, version: u64) {
-        if let Some(r) = self.partitions.get_mut(key)
-            && r.version == version
-        {
-            r.backoff = None;
-        }
+        self.update(key, |r| {
+            if r.version == version {
+                r.backoff = None;
+            }
+        });
     }
 
     /// Record the watermarks a fetch response reported.
@@ -644,7 +872,7 @@ impl SubscriptionState {
         log_start_offset: Option<Offset>,
         now: Instant,
     ) {
-        if let Some(r) = self.partitions.get_mut(key) {
+        self.update(key, |r| {
             if let Some(hw) = high_watermark {
                 r.high_watermark = Some(hw);
                 r.watermark_updated_at = Some(now);
@@ -655,7 +883,7 @@ impl SubscriptionState {
             if log_start_offset.is_some() {
                 r.log_start_offset = log_start_offset;
             }
-        }
+        });
     }
 
     /// Set or clear a partition's preferred read replica (KIP-392).
@@ -664,9 +892,7 @@ impl SubscriptionState {
         key: &PartitionKey,
         replica: Option<(BrokerId, Instant)>,
     ) {
-        if let Some(r) = self.partitions.get_mut(key) {
-            r.preferred_replica = replica;
-        }
+        self.update(key, |r| r.preferred_replica = replica);
     }
 
     // ── delivery ────────────────────────────────────────────────────────
@@ -676,7 +902,7 @@ impl SubscriptionState {
     /// [`complete_delivery`](Self::complete_delivery) or
     /// [`abort_delivery`](Self::abort_delivery).
     pub(super) fn take_delivery(&mut self, max: usize) -> Option<Delivery> {
-        if max == 0 {
+        if max == 0 || self.tally.deliverable == 0 {
             return None;
         }
         let mut delivery = Delivery::default();
@@ -714,6 +940,13 @@ impl SubscriptionState {
                 version: r.version,
                 count: take,
             });
+            Self::recount(
+                &mut self.tally,
+                &mut self.moved,
+                self.isolation_level,
+                key,
+                r,
+            );
         }
         Some(delivery)
     }
@@ -774,6 +1007,13 @@ impl SubscriptionState {
                     }
                 }
             }
+            Self::recount(
+                &mut self.tally,
+                &mut self.moved,
+                self.isolation_level,
+                &part.key,
+                r,
+            );
             out.extend(delivered);
         }
         out
@@ -796,23 +1036,36 @@ impl SubscriptionState {
 
     /// `(total, max)` lag over the partitions whose position and end offset
     /// are known.
-    pub(super) fn aggregate_lag(&self, isolation_level: IsolationLevel) -> (u64, u64) {
-        let mut total: u64 = 0;
-        let mut max: u64 = 0;
-        for r in self.partitions.values() {
-            if let Some(lag) = r.lag(isolation_level) {
-                total = total.saturating_add(lag);
-                max = max.max(lag);
-            }
-        }
-        (total, max)
+    pub(super) fn aggregate_lag(&self) -> (u64, u64) {
+        (
+            u64::try_from(self.tally.lag).unwrap_or(u64::MAX),
+            self.tally.lags.keys().next_back().copied().unwrap_or(0),
+        )
+    }
+
+    /// The partitions whose fetch position moved since the last call, each
+    /// with where its next fetch starts and its cached readable end offset;
+    /// the partitions revoked since are left out. Costs what moved, never
+    /// what is assigned.
+    pub(super) fn take_moved(&mut self) -> Vec<MovedPartition> {
+        let moved = std::mem::take(&mut self.moved);
+        moved
+            .into_iter()
+            .filter_map(|key| {
+                let record = self.partitions.get(&key)?;
+                Some(MovedPartition {
+                    fetch_position: record.fetch_position(),
+                    readable_end: record.readable_end_offset(self.isolation_level),
+                    key,
+                })
+            })
+            .collect()
     }
 
     /// Per-partition lag and the partitions whose watermark is older than
     /// `threshold`.
     pub(super) fn lag_report(
         &self,
-        isolation_level: IsolationLevel,
         now: Instant,
         threshold: Duration,
     ) -> HashMap<TopicPartition, PartitionLag> {
@@ -823,18 +1076,36 @@ impl SubscriptionState {
                     .watermark_updated_at
                     .is_none_or(|t| now.saturating_duration_since(t) > threshold);
                 (
-                    TopicPartition::new(topic.clone(), *partition),
+                    TopicPartition::new(topic.to_string(), *partition),
                     PartitionLag {
                         position: r.position,
                         log_start_offset: r.log_start_offset,
                         high_watermark: r.high_watermark,
                         last_stable_offset: r.last_stable_offset,
-                        lag: r.lag(isolation_level),
+                        lag: r.lag(self.isolation_level),
                         stale,
                     },
                 )
             })
             .collect()
+    }
+
+    /// Recount every partition from scratch and compare with the running
+    /// tally: what the gauges read must be what a full scan finds.
+    #[cfg(test)]
+    fn tally_matches_a_scan(&self) -> bool {
+        let mut scan = Tally::default();
+        for record in self.partitions.values() {
+            scan.add(&Counted::of(record, self.isolation_level));
+        }
+        scan.paused == self.tally.paused
+            && scan.buffered == self.tally.buffered
+            && scan.deliverable == self.tally.deliverable
+            && scan.needs_position == self.tally.needs_position
+            && scan.awaiting_reset == self.tally.awaiting_reset
+            && scan.unvalidated == self.tally.unvalidated
+            && scan.lag == self.tally.lag
+            && scan.lags == self.tally.lags
     }
 }
 
@@ -891,7 +1162,7 @@ mod tests {
     use super::*;
 
     fn key(topic: &str, partition: PartitionId) -> PartitionKey {
-        (topic.to_string(), partition)
+        (Arc::from(topic), partition)
     }
 
     fn record(topic: &str, partition: PartitionId, offset: Offset) -> ConsumerRecord {
@@ -1126,12 +1397,7 @@ mod tests {
         let now = Instant::now();
         state.update_watermarks(&key("t", 0), Some(10), None, None, now);
         let lag = |state: &SubscriptionState| {
-            state.lag_report(
-                IsolationLevel::ReadUncommitted,
-                now,
-                Duration::from_secs(60),
-            )[&TopicPartition::new("t", 0)]
-                .clone()
+            state.lag_report(now, Duration::from_secs(60))[&TopicPartition::new("t", 0)].clone()
         };
         assert_eq!(lag(&state).lag, Some(10));
         assert_eq!(lag(&state).high_watermark, Some(10));
@@ -1196,5 +1462,90 @@ mod tests {
         assert_eq!(r.position, Some(6));
         assert!(r.validated);
         assert!(r.epoch.is_none());
+    }
+
+    /// Every way a record changes keeps the running tally equal to a full
+    /// scan: what the gauges read per poll without scanning is what a scan
+    /// would find.
+    #[test]
+    fn the_tally_is_a_scan_after_every_change() {
+        let mut state = SubscriptionState::new(IsolationLevel::ReadCommitted);
+        let now = Instant::now();
+        state.add_partitions((0..4).map(|p| key("t", p)));
+        assert!(state.tally_matches_a_scan());
+        assert_eq!(state.partitions_needing_position(now).len(), 4);
+        for p in 0..3 {
+            state.seek(&key("t", p), 0).unwrap();
+            assert!(state.tally_matches_a_scan());
+        }
+        state
+            .request_reset(&key("t", 3), OffsetReset::Earliest)
+            .unwrap();
+        assert_eq!(state.partitions_awaiting_reset(now).len(), 1);
+        assert_eq!(state.unvalidated(now).len(), 3);
+        for target in state.fetch_targets(now) {
+            let p = target.key.1;
+            state.update_watermarks(&target.key, Some(20), Some(15 + i64::from(p)), Some(0), now);
+            assert!(state.install_fetch(&target, fetched("t", p, 0..5)));
+            assert!(state.tally_matches_a_scan());
+        }
+        assert_eq!(state.buffered_count(), 15);
+        assert_eq!(state.aggregate_lag(), (15 + 16 + 17, 17));
+        state.set_paused("t", &[1], true);
+        assert_eq!(state.paused_count(), 1);
+        let delivery = state.take_delivery(7).unwrap();
+        assert!(state.tally_matches_a_scan());
+        let _ = state.complete_delivery(delivery, 4);
+        assert!(state.tally_matches_a_scan());
+        state.mark_validated(&key("t", 0), state.partition(&key("t", 0)).unwrap().version);
+        state.mark_unvalidated(&key("t", 2));
+        assert!(state.truncate(&key("t", 2), None, 1).is_some());
+        assert!(state.tally_matches_a_scan());
+        state.remove_partitions([&key("t", 1)]);
+        assert!(state.tally_matches_a_scan());
+        assert_eq!(state.paused_count(), 0);
+        state.clear_assignment();
+        assert!(state.tally_matches_a_scan());
+        assert_eq!(state.aggregate_lag(), (0, 0));
+    }
+
+    /// The moved partitions are exactly those whose fetch position changed,
+    /// each once, and a revoked one is not reported.
+    #[test]
+    fn the_moved_partitions_are_the_ones_whose_fetch_position_changed() {
+        let mut state = SubscriptionState::default();
+        state.add_partitions((0..3).map(|p| key("t", p)));
+        assert!(state.take_moved().is_empty(), "no position yet");
+        for p in 0..3 {
+            state.seek(&key("t", p), 10).unwrap();
+        }
+        let moved: Vec<PartitionId> = state.take_moved().iter().map(|m| m.key.1).collect();
+        assert_eq!(moved, vec![0, 1, 2]);
+        assert!(state.take_moved().is_empty(), "taken once");
+        let targets = state.fetch_targets(Instant::now());
+        state.update_watermarks(&targets[0].key, Some(30), None, None, Instant::now());
+        assert!(state.take_moved().is_empty(), "a watermark is not a move");
+        let target = targets.iter().find(|t| t.key.1 == 1).unwrap();
+        assert!(state.install_fetch(target, fetched("t", 1, 10..12)));
+        let moved = state.take_moved();
+        assert_eq!(moved.len(), 1);
+        assert_eq!((moved[0].key.1, moved[0].fetch_position), (1, Some(12)));
+        state.seek(&key("t", 2), 4).unwrap();
+        state.remove_partitions([&key("t", 2)]);
+        assert!(state.take_moved().is_empty(), "a revoked partition is gone");
+    }
+
+    /// Every key of a topic shares one name.
+    #[test]
+    fn the_keys_of_a_topic_share_its_name() {
+        let mut state = SubscriptionState::default();
+        state.add_partitions((0..3).map(|p| key("t", p)));
+        let names: Vec<*const u8> = state
+            .assigned_keys()
+            .iter()
+            .map(|(topic, _)| topic.as_ptr())
+            .collect();
+        assert!(names.iter().all(|name| *name == names[0]));
+        assert_eq!(state.key("t", 7).0.as_ptr(), names[0]);
     }
 }

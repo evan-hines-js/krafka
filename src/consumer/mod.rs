@@ -115,6 +115,23 @@ pub struct PartitionLag {
     pub stale: bool,
 }
 
+/// A partition whose fetch position moved, as
+/// [`Consumer::moved_positions`] reports it.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MovedPosition {
+    /// The topic, its name shared with every key of it the consumer holds.
+    pub topic: Arc<str>,
+    /// The partition.
+    pub partition: PartitionId,
+    /// Where its next fetch starts now.
+    pub fetch_position: Option<Offset>,
+    /// Its cached readable end offset: the last stable offset under
+    /// `read_committed`, else the high watermark, as the latest fetch
+    /// response reported it.
+    pub readable_end: Option<Offset>,
+}
+
 /// A position being committed for one partition.
 ///
 /// The leader epoch is stored with the offset and returned by `OffsetFetch`,
@@ -218,11 +235,12 @@ impl Consumer {
             Arc::clone(&metrics_source),
         );
 
+        let state = SubscriptionState::new(config.isolation_level);
         Self {
             config,
             metadata,
             pool,
-            state: Arc::new(SyncMutex::new(SubscriptionState::default())),
+            state: Arc::new(SyncMutex::new(state)),
             commit_gate: Arc::new(tokio::sync::Mutex::new(())),
             closed: AtomicBool::new(false),
             wakeup_flag: AtomicBool::new(false),
@@ -300,10 +318,11 @@ impl Consumer {
             let dropped: Vec<PartitionKey> = state
                 .assigned_keys()
                 .into_iter()
-                .filter(|(t, p)| t == topic && !keep.contains(p))
+                .filter(|(t, p)| &**t == topic && !keep.contains(p))
                 .collect();
             state.remove_partitions(&dropped);
-            state.add_partitions(partitions.iter().map(|&p| (topic.to_string(), p)));
+            let name = state.topic(topic);
+            state.add_partitions(partitions.iter().map(|&p| (name.clone(), p)));
             state.subscription.insert(topic.to_string());
             // The caller owns this topic's partition list from here on; the
             // metadata-driven resolver must not widen it again.
@@ -322,9 +341,11 @@ impl Consumer {
     /// [`KrafkaError::IllegalState`] when the partition is not assigned;
     /// nothing is stored.
     pub async fn seek(&self, topic: &str, partition: PartitionId, offset: Offset) -> Result<()> {
-        self.state
-            .lock()
-            .seek(&(topic.to_string(), partition), offset)?;
+        {
+            let mut state = self.state.lock();
+            let key = state.key(topic, partition);
+            state.seek(&key, offset)?;
+        }
         self.metrics.record_seek(1);
         self.update_gauges();
         debug!("Seek to offset {} for {}-{}", offset, topic, partition);
@@ -346,7 +367,10 @@ impl Consumer {
             .into_iter()
             .map(|(tp, offset)| {
                 let tp = tp.borrow();
-                ((tp.topic.clone(), tp.partition), *offset.borrow())
+                (
+                    (Arc::from(tp.topic.as_str()), tp.partition),
+                    *offset.borrow(),
+                )
             })
             .collect();
         {
@@ -375,9 +399,11 @@ impl Consumer {
     ///
     /// [`KrafkaError::IllegalState`] when the partition is not assigned.
     pub async fn seek_to_beginning(&self, topic: &str, partition: PartitionId) -> Result<()> {
-        self.state
-            .lock()
-            .request_reset(&(topic.to_string(), partition), OffsetReset::Earliest)?;
+        {
+            let mut state = self.state.lock();
+            let key = state.key(topic, partition);
+            state.request_reset(&key, OffsetReset::Earliest)?;
+        }
         self.metrics.record_seek(1);
         Ok(())
     }
@@ -390,9 +416,11 @@ impl Consumer {
     ///
     /// [`KrafkaError::IllegalState`] when the partition is not assigned.
     pub async fn seek_to_end(&self, topic: &str, partition: PartitionId) -> Result<()> {
-        self.state
-            .lock()
-            .request_reset(&(topic.to_string(), partition), OffsetReset::Latest)?;
+        {
+            let mut state = self.state.lock();
+            let key = state.key(topic, partition);
+            state.request_reset(&key, OffsetReset::Latest)?;
+        }
         self.metrics.record_seek(1);
         Ok(())
     }
@@ -410,11 +438,11 @@ impl Consumer {
         partition: PartitionId,
         timestamp_ms: i64,
     ) -> Result<()> {
-        if !self
-            .state
-            .lock()
-            .is_assigned(&(topic.to_string(), partition))
-        {
+        let assigned = {
+            let state = self.state.lock();
+            state.is_assigned(&state.key(topic, partition))
+        };
+        if !assigned {
             return Err(KrafkaError::illegal_state(format!(
                 "no current assignment for partition {topic}-{partition}"
             )));
@@ -438,14 +466,19 @@ impl Consumer {
         let mut valid: Vec<PartitionKey> = Vec::with_capacity(partitions.len());
         for &(topic, partition) in partitions {
             match validate_topic_name(topic) {
-                Ok(()) => valid.push((topic.to_string(), partition)),
+                Ok(()) => valid.push((Arc::from(topic), partition)),
                 Err(e) => {
                     result.insert((topic.to_string(), partition), Err(e));
                 }
             }
         }
         if !valid.is_empty() {
-            result.extend(self.list_offsets(&Self::by_topic(&valid), timestamp).await);
+            result.extend(
+                self.list_offsets(&Self::by_topic(&valid), timestamp)
+                    .await
+                    .into_iter()
+                    .map(|((topic, partition), offset)| ((topic.to_string(), partition), offset)),
+            );
         }
         result
     }
@@ -629,7 +662,13 @@ impl Consumer {
                 other => other?,
             };
             if !round.no_offset.is_empty() {
-                return Err(KrafkaError::no_offset(round.no_offset));
+                return Err(KrafkaError::no_offset(
+                    round
+                        .no_offset
+                        .into_iter()
+                        .map(|(topic, partition)| (topic.to_string(), partition))
+                        .collect(),
+                ));
             }
             if let Some(fault) = round.faults.into_iter().next() {
                 self.metrics.record_error();
@@ -874,7 +913,7 @@ impl Consumer {
     /// first. `None` when the partition is not assigned or its position
     /// cannot be resolved yet.
     pub async fn position(&self, topic: &str, partition: PartitionId) -> Option<Offset> {
-        let key = (topic.to_string(), partition);
+        let key = self.state.lock().key(topic, partition);
         {
             let state = self.state.lock();
             let record = state.partition(&key)?;
@@ -891,10 +930,32 @@ impl Consumer {
     /// The offset the next fetch for this partition starts at. Runs ahead of
     /// [`position`](Self::position) by the records buffered for it.
     pub async fn fetch_position(&self, topic: &str, partition: PartitionId) -> Option<Offset> {
+        let state = self.state.lock();
+        state
+            .partition(&state.key(topic, partition))?
+            .fetch_position()
+    }
+
+    /// The partitions whose fetch position (where the next fetch starts)
+    /// moved since the last call, each with its new fetch position and its
+    /// cached readable end offset; every call takes what it reports, and a
+    /// partition revoked since is left out. A move is a seek, a reset, a
+    /// fetch installed, a delivery past the records buffered, or a
+    /// truncation rewind. What it costs is what moved, never what is
+    /// assigned: a caller who needs where every partition of its fetch ended
+    /// reads the ones that moved instead of asking each.
+    pub fn moved_positions(&self) -> Vec<MovedPosition> {
         self.state
             .lock()
-            .partition(&(topic.to_string(), partition))?
-            .fetch_position()
+            .take_moved()
+            .into_iter()
+            .map(|moved| MovedPosition {
+                topic: moved.key.0,
+                partition: moved.key.1,
+                fetch_position: moved.fetch_position,
+                readable_end: moved.readable_end,
+            })
+            .collect()
     }
 
     /// A snapshot of the current assignment.
@@ -916,11 +977,7 @@ impl Consumer {
     pub async fn lag(&self) -> StdHashMap<TopicPartition, PartitionLag> {
         self.state
             .lock()
-            .lag_report(
-                self.config.isolation_level,
-                Instant::now(),
-                self.config.lag_staleness_threshold,
-            )
+            .lag_report(Instant::now(), self.config.lag_staleness_threshold)
             .into_iter()
             .collect()
     }
@@ -928,9 +985,9 @@ impl Consumer {
     /// The cached readable end offset of a partition: the last stable offset
     /// under `read_committed`, else the high watermark.
     pub(crate) fn cached_end_offset(&self, topic: &str, partition: PartitionId) -> Option<Offset> {
-        self.state
-            .lock()
-            .partition(&(topic.to_string(), partition))?
+        let state = self.state.lock();
+        state
+            .partition(&state.key(topic, partition))?
             .readable_end_offset(self.config.isolation_level)
     }
 
@@ -1054,7 +1111,7 @@ impl Consumer {
         if !assigned.is_empty() {
             let partitions: Vec<TopicPartition> = assigned
                 .into_iter()
-                .map(|(t, p)| TopicPartition::new(t, p))
+                .map(|(t, p)| TopicPartition::new(t.to_string(), p))
                 .collect();
             self.rebalance_listener
                 .on_partitions_revoked_erased(&partitions)
@@ -1081,7 +1138,7 @@ impl Consumer {
                 if !assigned.is_empty() {
                     let partitions: Vec<TopicPartition> = assigned
                         .iter()
-                        .map(|(t, p)| TopicPartition::new(t.clone(), *p))
+                        .map(|(t, p)| TopicPartition::new(t.to_string(), *p))
                         .collect();
                     self.rebalance_listener
                         .on_partitions_revoked_erased(&partitions)
@@ -1263,8 +1320,8 @@ impl Consumer {
             (
                 state.buffered_count(),
                 state.assigned_count(),
-                state.paused().len(),
-                state.aggregate_lag(self.config.isolation_level),
+                state.paused_count(),
+                state.aggregate_lag(),
             )
         };
         self.metrics.buffered_records.set(buffered as u64);

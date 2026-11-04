@@ -92,7 +92,7 @@ pub(super) fn advance_through_batch(
 /// decode; it is decremented by what is decoded.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn decode_partition_batches(
-    topic_name: &str,
+    topic: &std::sync::Arc<str>,
     partition: PartitionId,
     mut batch_buf: bytes::Bytes,
     partition_fetch_offset: Offset,
@@ -117,8 +117,8 @@ pub(super) fn decode_partition_batches(
     // Sort by first_offset so entries can be activated in-order as the walk
     // reaches them.
     aborted_txns.sort_unstable_by_key(|at| at.first_offset);
-    // One allocation per partition response; every record shares it.
-    let topic: std::sync::Arc<str> = std::sync::Arc::from(topic_name);
+    // Every record shares the consumer's one name of the topic.
+    let topic_name: &str = topic;
     let mut aborted_txns_iter = aborted_txns.iter().peekable();
     // Producer IDs currently inside an open aborted transaction.
     let mut aborted_producers: HashSet<i64> = HashSet::new();
@@ -280,7 +280,7 @@ pub(super) fn decode_partition_batches(
                     used += 1;
 
                     records.push(ConsumerRecord {
-                        topic: std::sync::Arc::clone(&topic),
+                        topic: std::sync::Arc::clone(topic),
                         partition,
                         offset: record_offset,
                         timestamp: batch.base_timestamp.saturating_add(record.timestamp_delta),
@@ -506,7 +506,7 @@ mod tests {
         }
         let mut records = Vec::new();
         let outcome = decode_partition_batches(
-            "walk-topic",
+            &std::sync::Arc::from("walk-topic"),
             0,
             buf.freeze(),
             fetch_offset,
@@ -643,7 +643,7 @@ mod tests {
 
         let mut records = Vec::new();
         let outcome = decode_partition_batches(
-            "walk-topic",
+            &std::sync::Arc::from("walk-topic"),
             0,
             buf.freeze(),
             1000,
@@ -673,7 +673,7 @@ mod tests {
 
         let mut records = Vec::new();
         let outcome = decode_partition_batches(
-            "walk-topic",
+            &std::sync::Arc::from("walk-topic"),
             0,
             bad.freeze(),
             1000,
@@ -728,7 +728,7 @@ mod tests {
 
         let mut records = Vec::new();
         let outcome = decode_partition_batches(
-            "walk-topic",
+            &std::sync::Arc::from("walk-topic"),
             0,
             buf.freeze(),
             100,
@@ -789,7 +789,7 @@ mod tests {
         let before = decompressions();
         let mut records = Vec::new();
         let outcome = decode_partition_batches(
-            "walk-topic",
+            &std::sync::Arc::from("walk-topic"),
             0,
             wire.clone(),
             100,
@@ -808,7 +808,7 @@ mod tests {
         let before = decompressions();
         let mut records = Vec::new();
         decode_partition_batches(
-            "walk-topic",
+            &std::sync::Arc::from("walk-topic"),
             0,
             wire,
             100,
