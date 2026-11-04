@@ -7,15 +7,16 @@ use std::time::Duration;
 use ahash::AHashMap as HashMap;
 use tracing::{Instrument, debug};
 
+use crate::PartitionId;
 use crate::consumer::group::GroupCoordinator;
-use crate::consumer::state::{PartitionKey, SubscriptionState};
+use crate::consumer::state::SubscriptionState;
 use crate::consumer::{CommitPosition, Consumer};
 use crate::error::Result;
 use crate::interceptor::ConsumerInterceptor;
 use crate::metrics::ConsumerRecorder;
 
 /// Offsets to commit, per partition.
-pub(in crate::consumer) type CommitRequestOffsets = HashMap<PartitionKey, CommitPosition>;
+pub(in crate::consumer) type CommitRequestOffsets = HashMap<(String, PartitionId), CommitPosition>;
 
 /// Everything a commit needs, cloneable onto a background task.
 #[derive(Clone)]
@@ -46,9 +47,9 @@ impl Committer {
             .lock()
             .committable()
             .into_iter()
-            .map(|(key, offset, epoch)| {
+            .map(|((topic, partition), offset, epoch)| {
                 (
-                    key,
+                    (topic.to_string(), partition),
                     CommitPosition {
                         offset,
                         leader_epoch: epoch.unwrap_or(-1),

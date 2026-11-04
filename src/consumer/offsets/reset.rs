@@ -2,6 +2,7 @@
 //! position gets one: the group's committed offset, else a configured initial
 //! offset, else `auto_offset_reset`.
 
+use std::sync::Arc;
 use tokio::time::Instant;
 
 use ahash::AHashMap as HashMap;
@@ -44,7 +45,7 @@ fn build_request(
     let mut topics: HashMap<String, Vec<ListOffsetsRequestPartition>> = HashMap::new();
     for (topic, partition) in partitions {
         topics
-            .entry(topic.clone())
+            .entry(topic.to_string())
             .or_default()
             .push(ListOffsetsRequestPartition {
                 partition_index: *partition,
@@ -72,7 +73,7 @@ fn apply_response(
     let mut refresh: Vec<String> = Vec::new();
     for topic in &response.topics {
         for partition in &topic.partitions {
-            let key = (topic.name.clone(), partition.partition_index);
+            let key = (Arc::from(topic.name.as_str()), partition.partition_index);
             if partition.error_code.is_ok() {
                 result.insert(key, Ok(partition.offset));
                 continue;
@@ -123,7 +124,7 @@ impl Consumer {
         for (topic, parts) in partitions {
             for &p in parts {
                 result.insert(
-                    (topic.clone(), p),
+                    (Arc::from(topic.as_str()), p),
                     Err(KrafkaError::broker(
                         ErrorCode::LeaderNotAvailable,
                         format!("no leader found for {topic}-{p}"),
@@ -133,14 +134,14 @@ impl Consumer {
                     Some(leader) => by_leader
                         .entry(leader)
                         .or_default()
-                        .push((topic.clone(), p)),
-                    None => leaderless.push((topic.clone(), p)),
+                        .push((Arc::from(topic.as_str()), p)),
+                    None => leaderless.push((Arc::from(topic.as_str()), p)),
                 }
             }
         }
 
         if !leaderless.is_empty() {
-            let mut topics: Vec<&str> = leaderless.iter().map(|(t, _)| t.as_str()).collect();
+            let mut topics: Vec<&str> = leaderless.iter().map(|(t, _)| &**t).collect();
             topics.sort_unstable();
             topics.dedup();
             if let Err(e) = self.metadata.force_refresh(Some(&topics)).await {
@@ -236,7 +237,7 @@ impl Consumer {
         partitions.insert(topic.to_string(), vec![partition]);
         self.list_offsets(&partitions, timestamp)
             .await
-            .remove(&(topic.to_string(), partition))
+            .remove(&(Arc::from(topic), partition))
             .unwrap_or_else(|| {
                 Err(KrafkaError::protocol_kind(
                     ProtocolErrorKind::Malformed,
@@ -276,7 +277,11 @@ impl Consumer {
             let reset = OffsetReset::from_auto(self.config.auto_offset_reset);
             let mut state = self.state.lock();
             for pending in without_committed {
-                if let Some(&initial) = self.config.initial_offsets.get(&pending.key) {
+                if let Some(&initial) = self
+                    .config
+                    .initial_offsets
+                    .get(&(pending.key.0.to_string(), pending.key.1))
+                {
                     state.set_initial_position(&pending.key, pending.version, initial, None);
                 } else if let Some(reset) = reset {
                     state.set_pending_reset(&pending.key, pending.version, reset);
@@ -307,7 +312,10 @@ impl Consumer {
                 .collect();
             let mut by_topic: HashMap<String, Vec<PartitionId>> = HashMap::new();
             for p in &batch {
-                by_topic.entry(p.key.0.clone()).or_default().push(p.key.1);
+                by_topic
+                    .entry(p.key.0.to_string())
+                    .or_default()
+                    .push(p.key.1);
             }
             let mut resolved = self.list_offsets(&by_topic, reset.timestamp()).await;
             if matches!(reset, OffsetReset::ByDuration(_)) {
@@ -337,7 +345,12 @@ impl Consumer {
         if missing.is_empty() {
             Ok(())
         } else {
-            Err(KrafkaError::no_offset(missing))
+            Err(KrafkaError::no_offset(
+                missing
+                    .into_iter()
+                    .map(|(topic, partition)| (topic.to_string(), partition))
+                    .collect(),
+            ))
         }
     }
 
@@ -351,7 +364,7 @@ impl Consumer {
         let mut by_topic: HashMap<String, Vec<PartitionId>> = HashMap::new();
         for (key, result) in resolved.iter() {
             if matches!(result, Ok(offset) if *offset < 0) {
-                by_topic.entry(key.0.clone()).or_default().push(key.1);
+                by_topic.entry(key.0.to_string()).or_default().push(key.1);
             }
         }
         if by_topic.is_empty() {
@@ -374,14 +387,17 @@ impl Consumer {
         };
         let mut by_topic: HashMap<String, Vec<PartitionId>> = HashMap::new();
         for p in needing {
-            by_topic.entry(p.key.0.clone()).or_default().push(p.key.1);
+            by_topic
+                .entry(p.key.0.to_string())
+                .or_default()
+                .push(p.key.1);
         }
         match coordinator.fetch_committed_offsets(&by_topic).await {
             Ok(committed) => {
                 let mut state = self.state.lock();
                 let mut without = Vec::new();
                 for p in needing {
-                    match committed.get(&p.key) {
+                    match committed.get(&(p.key.0.to_string(), p.key.1)) {
                         Some(position) if position.offset >= 0 => {
                             let epoch =
                                 (position.leader_epoch >= 0).then_some(position.leader_epoch);
@@ -434,7 +450,7 @@ mod tests {
     #[test]
     fn every_request_carries_the_leader_epoch_from_metadata() {
         let request = build_request(
-            &[("t".to_string(), 0), ("t".to_string(), 1)],
+            &[(Arc::from("t"), 0), (Arc::from("t"), 1)],
             -2,
             1,
             |_, p| (p == 0).then_some(7),
@@ -464,9 +480,9 @@ mod tests {
             ]),
             &mut result,
         );
-        assert_eq!(*result[&("t".to_string(), 0)].as_ref().unwrap(), 42);
-        assert_eq!(*result[&("t".to_string(), 2)].as_ref().unwrap(), 99);
-        assert!(result[&("t".to_string(), 1)].is_err());
+        assert_eq!(*result[&(Arc::from("t"), 0)].as_ref().unwrap(), 42);
+        assert_eq!(*result[&(Arc::from("t"), 2)].as_ref().unwrap(), 99);
+        assert!(result[&(Arc::from("t"), 1)].is_err());
         assert_eq!(
             refresh,
             vec!["t".to_string()],
@@ -488,6 +504,6 @@ mod tests {
             &mut result,
         );
         assert!(refresh.is_empty());
-        assert!(result[&("t".to_string(), 0)].is_err());
+        assert!(result[&(Arc::from("t"), 0)].is_err());
     }
 }

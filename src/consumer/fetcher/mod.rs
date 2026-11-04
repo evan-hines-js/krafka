@@ -20,16 +20,18 @@ use crate::consumer::Consumer;
 use crate::consumer::fetch_session::FetchSessionClose;
 use crate::consumer::state::{CompletedFetch, FetchTarget, OffsetReset, PartitionKey};
 use crate::error::{ErrorCode, KrafkaError, ProtocolErrorKind, Result};
+use crate::metadata::TopicInfo;
 use crate::metadata::broker_info_for_node;
 use crate::protocol::{
     AbortedTransaction, ApiKey, DivergingEpoch, FetchPartitionRequest, FetchRequest, FetchResponse,
     FetchTopicRequest, LeaderIdAndEpoch, NodeEndpoint, VersionedDecode, VersionedEncode, versions,
 };
-use crate::{BrokerId, Offset};
+use crate::{BrokerId, Offset, PartitionId};
+use std::sync::Arc;
 
 use crate::consumer::offsets::needs_metadata_refresh;
 use decode::decode_partition_batches;
-use plan::build_fetch_routing_plan;
+use plan::{Route, build_fetch_routing_plan};
 
 /// A partition whose batch at the fetch position could not be decoded, so it
 /// cannot advance. Re-fetching returns the same bytes, so it is reported to
@@ -126,17 +128,27 @@ impl Consumer {
         if targets.is_empty() {
             return Ok(FetchRound::default());
         }
-        let leaders: HashMap<PartitionKey, BrokerId> = targets
-            .iter()
-            .filter_map(|t| {
-                self.metadata
-                    .leader(&t.key.0, t.key.1)
-                    .map(|leader| (t.key.clone(), leader))
-            })
-            .collect();
-        let plan = build_fetch_routing_plan(targets, &leaders);
+        // Each topic's metadata is read (and its use stamped) once per
+        // round, from the snapshot of the moment: a partition's leader and
+        // leader epoch come from its topic's entry, no lookup per partition.
+        // The targets come in key order (rotated once), so a topic's
+        // partitions are one run, or two.
+        let mut topic: Option<(Arc<str>, Option<Arc<TopicInfo>>)> = None;
+        let plan = build_fetch_routing_plan(targets, |key| {
+            if !topic
+                .as_ref()
+                .is_some_and(|(name, _)| Arc::ptr_eq(name, &key.0) || **name == *key.0)
+            {
+                topic = Some((key.0.clone(), self.metadata.topic_arc(&key.0)));
+            }
+            let info = topic.as_ref().and_then(|(_, info)| info.as_deref());
+            Route {
+                leader: info.and_then(|info| info.leader(key.1)),
+                leader_epoch: info.and_then(|info| info.leader_epoch(key.1)).unwrap_or(-1),
+            }
+        });
         if !plan.skipped.is_empty() {
-            let mut topics: Vec<&str> = plan.skipped.iter().map(|(t, _)| t.as_str()).collect();
+            let mut topics: Vec<&str> = plan.skipped.iter().map(|(t, _)| &**t).collect();
             topics.sort_unstable();
             topics.dedup();
             debug!(?topics, "Partitions without a leader; refreshing metadata");
@@ -319,8 +331,8 @@ impl Consumer {
                                         state.mark_unvalidated(key);
                                     }
                                     state.back_off(key, Some(p.target.version), now);
-                                    if !refresh.contains(&key.0) {
-                                        refresh.push(key.0.clone());
+                                    if !refresh.iter().any(|t| **t == *key.0) {
+                                        refresh.push(key.0.to_string());
                                     }
                                 }
                             }
@@ -391,46 +403,62 @@ impl Consumer {
             .ok_or_else(|| KrafkaError::unavailable(format!("broker {broker_id} not found")))?;
         let conn = self.pool.get_connection_by_id(broker_id, &address).await?;
 
-        let mut topic_order: Vec<String> = Vec::new();
-        let mut by_topic: HashMap<String, Vec<FetchPartitionRequest>> = HashMap::new();
+        // The request's topics in the order their first partition comes,
+        // each sized once: the targets come in key order rotated once, so a
+        // topic's partitions are one run or two.
+        let mut counts: Vec<(&Arc<str>, usize)> = Vec::new();
+        let mut run = 0;
         for target in targets {
-            let (topic, partition) = &target.key;
-            if !by_topic.contains_key(topic) {
-                topic_order.push(topic.clone());
+            if counts
+                .get(run)
+                .is_none_or(|(topic, _)| **topic != target.key.0)
+            {
+                match counts.iter().position(|(topic, _)| **topic == target.key.0) {
+                    Some(index) => run = index,
+                    None => {
+                        run = counts.len();
+                        counts.push((&target.key.0, 0));
+                    }
+                }
             }
-            by_topic
-                .entry(topic.clone())
-                .or_default()
-                .push(FetchPartitionRequest {
-                    partition: *partition,
-                    // Fences reads from a stale leader (KIP-320).
-                    current_leader_epoch: self
-                        .metadata
-                        .leader_epoch(topic, *partition)
-                        .unwrap_or(-1),
-                    fetch_offset: target.offset,
-                    // Lets the broker detect a diverged log; -1 when the epoch
-                    // at the position is unknown.
-                    last_fetched_epoch: target.last_fetched_epoch,
-                    log_start_offset: -1,
-                    partition_max_bytes: self
-                        .config
-                        .topic_fetch_max_bytes
-                        .get(topic.as_str())
-                        .copied()
-                        .unwrap_or(self.config.max_partition_fetch_bytes),
-                    replica_directory_id: None,
-                    high_watermark: None,
-                });
+            counts[run].1 += 1;
         }
-        let mut fetch_topics: Vec<FetchTopicRequest> = topic_order
-            .into_iter()
-            .map(|topic| FetchTopicRequest {
-                partitions: by_topic.remove(&topic).unwrap_or_default(),
-                topic,
+        let mut fetch_topics: Vec<FetchTopicRequest> = counts
+            .iter()
+            .map(|(topic, count)| FetchTopicRequest {
+                topic: topic.to_string(),
                 topic_id: None,
+                partitions: Vec::with_capacity(*count),
             })
             .collect();
+        let mut run = 0;
+        for target in targets {
+            let (topic, partition) = &target.key;
+            if fetch_topics.get(run).is_none_or(|t| *t.topic != **topic) {
+                let Some(index) = fetch_topics.iter().position(|t| *t.topic == **topic) else {
+                    continue;
+                };
+                run = index;
+            }
+            fetch_topics[run].partitions.push(FetchPartitionRequest {
+                partition: *partition,
+                // Fences reads from a stale leader (KIP-320).
+                current_leader_epoch: target.leader_epoch,
+                fetch_offset: target.offset,
+                // Lets the broker detect a diverged log; -1 when the epoch
+                // at the position is unknown.
+                last_fetched_epoch: target.last_fetched_epoch,
+                log_start_offset: -1,
+                partition_max_bytes: self
+                    .config
+                    .topic_fetch_max_bytes
+                    .get(&**topic)
+                    .copied()
+                    .unwrap_or(self.config.max_partition_fetch_bytes),
+                replica_directory_id: None,
+                high_watermark: None,
+            });
+        }
 
         // v7 fetch sessions (KIP-227), v9 leader-epoch fencing (KIP-320), v11
         // rack id (KIP-392), v13 topic ids (KIP-516). v17/v18 add only
@@ -500,6 +528,9 @@ impl Consumer {
         // fetch is a full one instead of hitting INVALID_FETCH_SESSION_EPOCH.
         let response = conn
             .send_request(ApiKey::Fetch, fetch_version, |buf| {
+                // Room for the whole request at once, not grown by doubling
+                // as a full fetch of many partitions is written.
+                buf.reserve(fetch_request_bound(&request));
                 request.encode_versioned(fetch_version, buf)
             })
             .await
@@ -561,16 +592,21 @@ impl Consumer {
                 .update_from_response(response.session_id, &fetch_topics);
         }
 
-        let by_key: HashMap<PartitionKey, &FetchTarget> =
-            targets.iter().map(|t| (t.key.clone(), t)).collect();
-        let mut partitions = Vec::new();
+        // An incremental session's answer names only what changed: an idle
+        // one names nothing, and nothing is indexed for it.
+        let answered: usize = response.responses.iter().map(|t| t.partitions.len()).sum();
+        let by_key: HashMap<(&str, PartitionId), &FetchTarget> = if answered == 0 {
+            HashMap::new()
+        } else {
+            targets.iter().map(|t| ((&*t.key.0, t.key.1), t)).collect()
+        };
+        let mut partitions = Vec::with_capacity(answered);
         for topic_response in response.responses {
             for p in topic_response.partitions {
-                let key = (topic_response.topic.clone(), p.partition);
-                let Some(target) = by_key.get(&key) else {
+                let Some(target) = by_key.get(&(topic_response.topic.as_str(), p.partition)) else {
                     debug!(
-                        topic = %key.0,
-                        partition = key.1,
+                        topic = %topic_response.topic,
+                        partition = p.partition,
                         "Fetch response for a partition that was not requested; ignoring"
                     );
                     continue;
@@ -649,6 +685,27 @@ impl Consumer {
     }
 }
 
+/// At least the bytes `request` encodes to at any version: per topic its
+/// name, its id and two lengths; per partition at most 48 bytes of fixed
+/// fields (Fetch v17 carries 36 plus tagged fields); the fixed header
+/// fields and the rack id.
+fn fetch_request_bound(request: &FetchRequest) -> usize {
+    const HEADER: usize = 64;
+    const TOPIC: usize = 32;
+    const PARTITION: usize = 48;
+    let fetched: usize = request
+        .topics
+        .iter()
+        .map(|t| TOPIC + t.topic.len() + PARTITION * t.partitions.len())
+        .sum();
+    let forgotten: usize = request
+        .forgotten_topics
+        .iter()
+        .map(|t| TOPIC + t.topic.len() + 4 * t.partitions.len())
+        .sum();
+    HEADER + request.rack_id.len() + fetched + forgotten
+}
+
 /// The final-epoch `Fetch` that closes a session. It carries the configured
 /// wait and size limits as the Java client does: Redpanda never answers a
 /// close with `max_wait_ms = 0`, which would block every later response on the
@@ -700,7 +757,7 @@ mod tests {
     #[test]
     fn a_decode_fault_names_the_partition_and_the_remedies() {
         let fault = FetchFault {
-            key: ("t".to_string(), 3),
+            key: (std::sync::Arc::from("t"), 3),
             offset: 17,
             error: KrafkaError::protocol_kind(ProtocolErrorKind::CrcMismatch, "bad crc"),
         };

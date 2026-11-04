@@ -43,7 +43,7 @@ fn test_consumer() -> Consumer {
 /// Assign `orders-0` at position 0 with `count` records buffered.
 fn buffer_records(consumer: &Consumer, count: i64) {
     let mut state = consumer.state.lock();
-    let key = ("orders".to_string(), 0);
+    let key = (std::sync::Arc::from("orders"), 0);
     state.add_partitions([key.clone()]);
     state.seek(&key, 0).unwrap();
     let target = state.fetch_targets(Instant::now()).remove(0);
@@ -64,7 +64,7 @@ fn position(consumer: &Consumer) -> Option<Offset> {
     consumer
         .state
         .lock()
-        .partition(&("orders".to_string(), 0))
+        .partition(&(std::sync::Arc::from("orders"), 0))
         .and_then(|r| r.position)
 }
 

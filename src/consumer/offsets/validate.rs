@@ -78,8 +78,8 @@ impl Consumer {
                             ?code,
                             "OffsetForLeaderEpoch rejected; backing off"
                         );
-                        if needs_metadata_refresh(code) && !refresh.contains(&key.0) {
-                            refresh.push(key.0.clone());
+                        if needs_metadata_refresh(code) && !refresh.iter().any(|t| **t == *key.0) {
+                            refresh.push(key.0.to_string());
                         }
                         state.back_off(&key, Some(version), now);
                     }
