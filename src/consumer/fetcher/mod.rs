@@ -77,6 +77,9 @@ pub(super) struct FetchRound {
     pub(super) no_offset: Vec<PartitionKey>,
     /// Whether any fetch request was sent.
     pub(super) requested: bool,
+    /// The round's metadata refresh found a leader for a partition it had
+    /// none for: that partition is fetchable now.
+    pub(super) leaders_found: bool,
     /// Every broker answered, and no partition with an error: what an empty
     /// round says is that the broker held the fetch for its whole wait.
     pub(super) answered: bool,
@@ -154,9 +157,32 @@ impl Consumer {
             debug!(?topics, "Partitions without a leader; refreshing metadata");
             let _ =
                 tokio::time::timeout(max_wait, self.metadata.force_refresh(Some(&topics))).await;
-        }
-        if plan.by_broker.is_empty() {
-            return Ok(FetchRound::default());
+            // A partition still without a leader backs off, so the poll
+            // waits for its backoff to end instead of refreshing again at
+            // once; one the refresh found a leader for is fetched next round.
+            let leaderless: Vec<&PartitionKey> = plan
+                .skipped
+                .iter()
+                .filter(|key| {
+                    self.metadata
+                        .topic_arc(&key.0)
+                        .and_then(|info| info.leader(key.1))
+                        .is_none()
+                })
+                .collect();
+            if !leaderless.is_empty() {
+                let now = Instant::now();
+                let mut state = self.state.lock();
+                for key in &leaderless {
+                    state.back_off(key, None, now);
+                }
+            }
+            if plan.by_broker.is_empty() {
+                return Ok(FetchRound {
+                    leaders_found: leaderless.len() < plan.skipped.len(),
+                    ..FetchRound::default()
+                });
+            }
         }
 
         let fetches = plan

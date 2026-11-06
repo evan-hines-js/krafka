@@ -26,6 +26,7 @@
 
 mod assignor;
 mod builder;
+mod changes;
 mod config;
 mod fetch_session;
 mod fetcher;
@@ -180,8 +181,12 @@ pub struct Consumer {
     /// A flag as well as a `Notify`, so a `wakeup()` that lands before
     /// `poll()` is called still takes effect.
     wakeup_flag: AtomicBool,
-    /// Wakes a `poll()` parked on a fetch or an idle wait.
+    /// Interrupts a `poll()` parked on a fetch.
     wakeup_notify: tokio::sync::Notify,
+    /// Raised by everything that can change what a `poll()` with nothing to
+    /// fetch would answer; the group's events raise it too (one signal,
+    /// shared with the group coordinator).
+    changes: Arc<changes::Changes>,
     group_coordinator: Option<Arc<GroupCoordinator>>,
     metrics: Arc<ConsumerRecorder>,
     /// Where `metrics()` and the KIP-714 reporter read from.
@@ -235,6 +240,9 @@ impl Consumer {
             Arc::clone(&metrics_source),
         );
 
+        let changes = group_coordinator
+            .as_ref()
+            .map_or_else(Arc::default, |coordinator| coordinator.changes());
         let state = SubscriptionState::new(config.isolation_level);
         Self {
             config,
@@ -245,6 +253,7 @@ impl Consumer {
             closed: AtomicBool::new(false),
             wakeup_flag: AtomicBool::new(false),
             wakeup_notify: tokio::sync::Notify::new(),
+            changes,
             group_coordinator,
             metrics,
             metrics_source,
@@ -295,6 +304,7 @@ impl Consumer {
             }
             self.resolve_standalone_subscription(true).await?;
         }
+        self.changes.raise();
         debug!("Subscribed to topics: {:?}", topics);
         Ok(())
     }
@@ -329,6 +339,7 @@ impl Consumer {
             state.standalone_topics.remove(topic);
         }
         self.update_gauges();
+        self.changes.raise();
         debug!("Assigned partitions for {}: {:?}", topic, partitions);
         Ok(())
     }
@@ -348,6 +359,7 @@ impl Consumer {
         }
         self.metrics.record_seek(1);
         self.update_gauges();
+        self.changes.raise();
         debug!("Seek to offset {} for {}-{}", offset, topic, partition);
         Ok(())
     }
@@ -388,6 +400,7 @@ impl Consumer {
         }
         self.metrics.record_seek(offsets.len() as u64);
         self.update_gauges();
+        self.changes.raise();
         Ok(())
     }
 
@@ -405,6 +418,7 @@ impl Consumer {
             state.request_reset(&key, OffsetReset::Earliest)?;
         }
         self.metrics.record_seek(1);
+        self.changes.raise();
         Ok(())
     }
 
@@ -422,6 +436,7 @@ impl Consumer {
             state.request_reset(&key, OffsetReset::Latest)?;
         }
         self.metrics.record_seek(1);
+        self.changes.raise();
         Ok(())
     }
 
@@ -620,86 +635,108 @@ impl Consumer {
         self.metrics.polls.inc();
         let deadline = Instant::now() + timeout;
 
-        if self.maintain_group(timeout).await? {
-            self.metrics.empty_polls.inc();
-            return Ok(Vec::new());
-        }
-
-        loop {
-            let records = self.deliver(max)?;
-            if !records.is_empty() {
-                return Ok(records);
-            }
-
-            self.update_positions(None).await?;
-            self.validate_positions().await;
-
-            let buffered = self.state.lock().buffered_count();
-            let cap = self.config.max_buffered_records;
-            if cap > 0 && buffered >= cap as usize {
-                // Only records of paused partitions can be left buffered here.
-                debug!(buffered, cap, "Buffer cap reached, skipping fetch");
+        // Each pass brings the group up to date, then delivers and fetches
+        // until nothing can be fetched, and waits for what can change that:
+        // a change (resume, seek, assignment, group event, close, wakeup)
+        // starts the next pass; a backoff's end or the deadline is a timer
+        // set to its instant. Nothing wakes the poll on a period.
+        'pass: loop {
+            // Taken before anything is looked at: a change from here on
+            // ends the wait below at once.
+            let mark = self.changes.mark();
+            if self.closed.load(Ordering::SeqCst) {
                 break;
             }
-            // Decode one delivery's worth plus what the buffer has room for,
-            // so the next poll is often served without a round trip and a
-            // large response is not decoded only to be thrown away.
-            let budget = (max != usize::MAX).then(|| {
-                let headroom = if cap > 0 {
-                    (cap as usize).saturating_sub(buffered)
-                } else {
-                    max
-                };
-                max.saturating_add(headroom)
-            });
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            let wait = self.config.fetch_max_wait.min(remaining);
-            let round = match self.fetch_round(wait, budget).await {
-                Err(KrafkaError::Wakeup) => {
-                    self.wakeup_flag.store(false, Ordering::Release);
-                    return Err(KrafkaError::Wakeup);
+            if self.wakeup_flag.swap(false, Ordering::AcqRel) {
+                return Err(KrafkaError::Wakeup);
+            }
+            let budget = deadline.saturating_duration_since(Instant::now());
+            if self.maintain_group(budget).await? {
+                break;
+            }
+
+            loop {
+                let records = self.deliver(max)?;
+                if !records.is_empty() {
+                    return Ok(records);
                 }
-                other => other?,
-            };
-            if !round.no_offset.is_empty() {
-                return Err(KrafkaError::no_offset(
-                    round
-                        .no_offset
-                        .into_iter()
-                        .map(|(topic, partition)| (topic.to_string(), partition))
-                        .collect(),
-                ));
-            }
-            if let Some(fault) = round.faults.into_iter().next() {
-                self.metrics.record_error();
-                return Err(fault.into_error(1));
-            }
-            if self.state.lock().has_deliverable() {
-                continue;
-            }
-            // A fetch the broker was asked to hold for the rest of the poll
-            // was answered empty, with no error: the poll's wait is over. A broker answers at
-            // its max wait in whole milliseconds, a little before the
-            // client's deadline, and fetching again for the sliver left
-            // sends another empty fetch per poll (Redpanda: exactly two per
-            // idle poll).
-            if round.answered && wait == remaining {
-                break;
-            }
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                break;
-            }
-            if !round.requested {
-                // Nothing was fetchable (paused, backing off, no leader):
-                // wait a little rather than spin.
-                let idle = self.config.idle_poll_backoff.max(Duration::from_millis(1));
-                tokio::select! {
-                    () = self.wakeup_notify.notified() => {
-                        self.wakeup_flag.store(false, Ordering::Release);
-                        return Err(KrafkaError::Wakeup);
+
+                self.update_positions(None).await?;
+                self.validate_positions().await;
+
+                let buffered = self.state.lock().buffered_count();
+                let cap = self.config.max_buffered_records;
+                let backoff_end = if cap > 0 && buffered >= cap as usize {
+                    // Only records of paused partitions can be left buffered
+                    // here: nothing is fetched until one is resumed or sought.
+                    debug!(buffered, cap, "Buffer cap reached, skipping fetch");
+                    None
+                } else {
+                    // Decode one delivery's worth plus what the buffer has
+                    // room for, so the next poll is often served without a
+                    // round trip and a large response is not decoded only to
+                    // be thrown away.
+                    let budget = (max != usize::MAX).then(|| {
+                        let headroom = if cap > 0 {
+                            (cap as usize).saturating_sub(buffered)
+                        } else {
+                            max
+                        };
+                        max.saturating_add(headroom)
+                    });
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    let wait = self.config.fetch_max_wait.min(remaining);
+                    let round = match self.fetch_round(wait, budget).await {
+                        Err(KrafkaError::Wakeup) => {
+                            self.wakeup_flag.store(false, Ordering::Release);
+                            return Err(KrafkaError::Wakeup);
+                        }
+                        other => other?,
+                    };
+                    if !round.no_offset.is_empty() {
+                        return Err(KrafkaError::no_offset(
+                            round
+                                .no_offset
+                                .into_iter()
+                                .map(|(topic, partition)| (topic.to_string(), partition))
+                                .collect(),
+                        ));
                     }
-                    () = tokio::time::sleep(idle.min(remaining)) => {}
+                    if let Some(fault) = round.faults.into_iter().next() {
+                        self.metrics.record_error();
+                        return Err(fault.into_error(1));
+                    }
+                    if self.state.lock().has_deliverable() {
+                        continue;
+                    }
+                    // A fetch the broker was asked to hold for the rest of
+                    // the poll was answered empty, with no error: the poll's
+                    // wait is over. A broker answers at its max wait in whole
+                    // milliseconds, a little before the client's deadline,
+                    // and fetching again for the sliver left sends another
+                    // empty fetch per poll (Redpanda: exactly two per idle
+                    // poll).
+                    if round.answered && wait == remaining {
+                        break 'pass;
+                    }
+                    if Instant::now() >= deadline {
+                        break 'pass;
+                    }
+                    if round.requested || round.leaders_found {
+                        continue;
+                    }
+                    // Nothing was fetchable: every partition paused, backing
+                    // off, without a position or without a leader (which
+                    // backs off too).
+                    self.state.lock().next_backoff_end(Instant::now())
+                };
+                let until = backoff_end.map_or(deadline, |end| end.min(deadline));
+                tokio::select! {
+                    () = self.changes.since(mark) => continue 'pass,
+                    () = tokio::time::sleep_until(until) => {}
+                }
+                if Instant::now() >= deadline {
+                    break 'pass;
                 }
             }
         }
@@ -1023,8 +1060,11 @@ impl Consumer {
 
     /// Resume paused partitions.
     pub async fn resume(&self, topic: &str, partitions: &[PartitionId]) {
-        self.state.lock().set_paused(topic, partitions, false);
+        let applied = self.state.lock().set_paused(topic, partitions, false);
         self.update_gauges();
+        if applied > 0 {
+            self.changes.raise();
+        }
     }
 
     /// The paused partitions.
@@ -1102,6 +1142,8 @@ impl Consumer {
         if self.closed.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
+        // A poll waiting in another task returns now.
+        self.changes.raise();
         let commit_result = if self.config.enable_auto_commit {
             self.commit().await
         } else {
@@ -1157,6 +1199,7 @@ impl Consumer {
             state.standalone_topics.clear();
             state.clear_assignment();
         }
+        self.changes.raise();
         self.close_fetch_sessions().await;
         self.update_gauges();
     }
@@ -1283,6 +1326,7 @@ impl Consumer {
     pub fn wakeup(&self) {
         self.wakeup_flag.store(true, Ordering::Release);
         self.wakeup_notify.notify_waiters();
+        self.changes.raise();
     }
 
     /// This consumer's identity within its group, for

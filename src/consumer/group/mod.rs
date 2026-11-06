@@ -504,6 +504,12 @@ impl GroupCoordinator {
         *self.pending_rebalance.lock() = None;
     }
 
+    /// The signal a poll with nothing to fetch waits on; every group event
+    /// raises it.
+    pub(crate) fn changes(&self) -> Arc<crate::consumer::changes::Changes> {
+        Arc::clone(self.heartbeat.changes())
+    }
+
     /// Whether a join round is running.
     pub(crate) fn rejoin_in_flight(&self) -> bool {
         *self.rejoin_in_flight.borrow()

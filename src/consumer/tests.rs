@@ -29,6 +29,7 @@ fn test_consumer() -> Consumer {
         closed: AtomicBool::new(false),
         wakeup_flag: AtomicBool::new(false),
         wakeup_notify: tokio::sync::Notify::new(),
+        changes: Arc::default(),
         group_coordinator: None,
         metrics,
         metrics_source,

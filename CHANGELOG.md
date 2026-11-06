@@ -13,6 +13,11 @@ not a complete record.
 
 ## [Unreleased]
 
+### Breaking
+
+- `ConsumerBuilder::idle_poll_backoff` is removed: a poll with nothing to
+  fetch no longer wakes on a period, so there is nothing to tune.
+
 ### Added
 
 - `ConsumerMetrics::join_rounds`, `join_rounds_superseded` and
@@ -23,6 +28,18 @@ not a complete record.
 
 ### Fixed
 
+- A poll with nothing to fetch (every partition paused, backing off, or
+  without a leader, or the buffer full of paused partitions' records) waits
+  for what can change its answer and wakes once for each: a resume, a seek,
+  an assignment or subscription change, a group event (a rebalance asked for
+  on a heartbeat, a lost membership, a finished join round, a KIP-848
+  assignment), `close()`, `wakeup()`, the end of a partition's backoff, or
+  its deadline. It woke every 10 ms (`idle_poll_backoff`) until its deadline,
+  and noticed group events only on the next poll. A partition the round's
+  metadata refresh finds no leader for backs off (100 ms doubling to 30 s)
+  instead of being refreshed again at once, and a poll whose buffer is full
+  of paused partitions' records waits instead of returning empty at once to
+  a caller that polls again.
 - A classic join round whose `SyncGroup` is answered
   `REBALANCE_IN_PROGRESS` (a newer round began while members came and went)
   is counted superseded and logged at debug: the member joins the newer

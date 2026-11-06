@@ -326,14 +326,6 @@ pub(crate) struct ConsumerConfig {
     ///
     /// Default: 60 s. Set to `Duration::MAX` to disable staleness reporting.
     pub(crate) lag_staleness_threshold: Duration,
-    /// How long `poll()` waits when no partition can be fetched (all paused
-    /// or backing off).
-    ///
-    /// A small backoff here prevents a tight busy-loop while still draining
-    /// the consumer within the caller's timeout window. Default: 10 ms,
-    /// which limits the no-data retry rate to ~100 iterations/second.
-    /// Latency-sensitive callers may reduce this toward `Duration::ZERO`.
-    pub(crate) idle_poll_backoff: Duration,
     /// Push this client's metrics to brokers that subscribe to them (KIP-714,
     /// Java `enable.metrics.push`).
     pub(crate) metrics_push: bool,
@@ -371,7 +363,6 @@ impl Default for ConsumerConfig {
             max_decompressed_size: crate::protocol::RecordBatch::MAX_DECOMPRESSED_SIZE,
             initial_offsets: HashMap::new(),
             lag_staleness_threshold: Duration::from_secs(60),
-            idle_poll_backoff: Duration::from_millis(10),
             metrics_push: true,
         }
     }

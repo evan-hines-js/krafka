@@ -264,16 +264,6 @@ impl ConsumerBuilder {
         self
     }
 
-    /// Set how long `poll()` waits when no partition can be fetched (all
-    /// paused or backing off).
-    ///
-    /// Smaller values reduce latency, at the cost of CPU while idle.
-    /// Default: 10 ms.
-    pub fn idle_poll_backoff(mut self, backoff: Duration) -> Self {
-        self.config.idle_poll_backoff = backoff;
-        self
-    }
-
     /// Set a rebalance listener to be notified of partition assignment changes.
     pub fn rebalance_listener(
         mut self,
