@@ -821,3 +821,112 @@ async fn no_heartbeat_is_sent_while_a_held_join_is_in_flight() {
 async fn a_held_sync_has_the_join_budget() {
     a_held_round_completes(Held::Sync, "g-held-sync").await;
 }
+
+// ── A join round superseded by a newer one ──────────────────────────────
+
+/// Counts the warnings logged while it is the thread's default subscriber.
+#[derive(Clone, Default)]
+struct Warnings(Arc<Mutex<Vec<String>>>);
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Warnings {
+    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        struct Message(String);
+        impl tracing::field::Visit for Message {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    self.0 = format!("{value:?}");
+                }
+            }
+        }
+        if *event.metadata().level() == tracing::Level::WARN {
+            let mut message = Message(String::new());
+            event.record(&mut message);
+            self.0.lock().unwrap().push(message.0);
+        }
+    }
+}
+
+/// A `SyncGroup` answered `REBALANCE_IN_PROGRESS` (a newer round began
+/// before this member synced: members joined or left meanwhile) is a step
+/// of the protocol, not a failure: the member joins the newer round at
+/// once (one more `JoinGroup` and `SyncGroup`, no more), the round is
+/// counted superseded and none failed, and nothing is warned about. Kind's
+/// scale-out (three workers to six) logged 23-40 "Join failed, retrying"
+/// per new worker, every one of them this.
+#[tokio::test]
+async fn a_sync_superseded_by_a_newer_round_is_a_protocol_step_and_the_member_joins_that_round() {
+    use tracing_subscriber::layer::SubscriberExt;
+    let warnings = Warnings::default();
+    let _logs =
+        tracing::subscriber::set_default(tracing_subscriber::registry().with(warnings.clone()));
+    let broker = Arc::new(FakeBroker::start().await.unwrap());
+    broker.create_topic("events", 1);
+    let events = Events(Arc::default());
+    let kafka = krafka::Kafka::builder(broker.bootstrap_servers())
+        .request_timeout(T)
+        .connect_timeout(T)
+        .connect()
+        .await
+        .unwrap();
+    let consumer = kafka
+        .consumer("g-superseded")
+        .partition_assignment_strategy(
+            krafka::consumer::PartitionAssignmentStrategy::CooperativeSticky,
+        )
+        .heartbeat_interval(Duration::from_millis(100))
+        .rebalance_listener(Events(events.0.clone()))
+        .build()
+        .await
+        .unwrap();
+    consumer.subscribe(&["events"]).await.unwrap();
+    wait_assigned(&consumer).await;
+    let joins = broker.request_count(ApiKey::JoinGroup);
+    let syncs = broker.request_count(ApiKey::SyncGroup);
+    let before = consumer.metrics().consumer;
+    assert_eq!(
+        (
+            before.join_rounds,
+            before.join_rounds_superseded,
+            before.join_rounds_failed
+        ),
+        (1, 0, 0),
+        "the first round joined"
+    );
+    warnings.0.lock().unwrap().clear();
+
+    broker.on_once(ApiKey::SyncGroup, |_| {
+        Control::Error(ErrorCode::RebalanceInProgress)
+    });
+    broker.on_once(ApiKey::Heartbeat, |_| {
+        Control::Error(ErrorCode::RebalanceInProgress)
+    });
+    let deadline = Instant::now() + T * 10;
+    while consumer.metrics().consumer.join_rounds == before.join_rounds {
+        assert!(Instant::now() < deadline, "the member never joined again");
+        let _ = consumer.poll(Duration::from_millis(200)).await;
+    }
+
+    let after = consumer.metrics().consumer;
+    assert_eq!(
+        after.join_rounds,
+        before.join_rounds + 1,
+        "one round joined"
+    );
+    assert_eq!(after.join_rounds_superseded, 1, "one round superseded");
+    assert_eq!(after.join_rounds_failed, 0, "no round failed");
+    assert_eq!(
+        broker.request_count(ApiKey::JoinGroup),
+        joins + 2,
+        "the superseded round's join and the newer round's"
+    );
+    assert_eq!(
+        broker.request_count(ApiKey::SyncGroup),
+        syncs + 2,
+        "the superseded round's sync and the newer round's"
+    );
+    assert_eq!(events.count("lost"), 0, "{:?}", events.kinds());
+    assert!(!consumer.assignment().await.is_empty());
+    let warned = warnings.0.lock().unwrap().clone();
+    assert!(warned.is_empty(), "warned: {warned:?}");
+    let _ = consumer.close().await;
+}

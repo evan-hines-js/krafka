@@ -142,6 +142,9 @@ At most 1000 topics get their own series; the rest are folded into
 | `krafka_consumer_commits_total` | `coordinator.commit.total` | counter | Offset or acknowledgement commits |
 | `krafka_consumer_errors_total` | `error.total` | counter | Errors returned from `poll`/`recv` |
 | `krafka_consumer_rebalances_total` | `coordinator.rebalance.total` | counter | Assignment changes applied |
+| `krafka_consumer_join_rounds_total` | `coordinator.join.total` | counter | Classic join rounds that ended with an assignment |
+| `krafka_consumer_join_rounds_superseded_total` | `coordinator.join.superseded.total` | counter | Classic join rounds a newer round replaced before the member synced (`REBALANCE_IN_PROGRESS`): a protocol step, not a failure |
+| `krafka_consumer_join_rounds_failed_total` | `coordinator.join.failed.total` | counter | Classic join rounds that failed (each also a `warn!`) |
 | `krafka_consumer_seeks_total` | `seek.total` | counter | Partitions repositioned |
 | `krafka_consumer_batch_decode_errors_total` | `fetch.manager.batch.decode.error.total` | counter | Corrupt record batches |
 | `krafka_consumer_lag` | `fetch.manager.records.lag.total` | gauge | Records behind, summed over assigned partitions |

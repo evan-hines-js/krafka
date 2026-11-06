@@ -31,6 +31,48 @@ enum Protocol {
     Kip848,
 }
 
+/// What a classic join round that did not end with an assignment was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JoinOutcome {
+    /// A newer round began before this member's `SyncGroup` was answered
+    /// (`REBALANCE_IN_PROGRESS`): members joined or left meanwhile. The
+    /// protocol's own step; the member joins the newer round.
+    Superseded,
+    /// A failure the member recovers from by joining again: the
+    /// coordinator unreachable or moved past the round's retries, a request
+    /// timed out, the member forgotten or fenced by generation.
+    Retriable,
+    /// A failure the poll returns.
+    Fatal,
+}
+
+impl JoinOutcome {
+    fn of(error: &KrafkaError) -> Self {
+        match error {
+            KrafkaError::Broker {
+                code: ErrorCode::RebalanceInProgress,
+                ..
+            } => Self::Superseded,
+            error
+                if error.is_retriable()
+                    || is_coordinator_retriable(error)
+                    || matches!(
+                        error,
+                        KrafkaError::Broker {
+                            code: ErrorCode::UnknownMemberId
+                                | ErrorCode::IllegalGeneration
+                                | ErrorCode::MemberIdRequired,
+                            ..
+                        }
+                    ) =>
+            {
+                Self::Retriable
+            }
+            _ => Self::Fatal,
+        }
+    }
+}
+
 fn to_topic_partitions(keys: &[PartitionKey]) -> Vec<TopicPartition> {
     keys.iter()
         .map(|(topic, partition)| TopicPartition::new(topic.to_string(), *partition))
@@ -111,7 +153,8 @@ impl Consumer {
         Ok(false)
     }
 
-    /// Apply the outcome of a classic join round.
+    /// Apply the outcome of a classic join round, counting it as what it
+    /// was ([`JoinOutcome`]).
     async fn apply_join(
         &self,
         coordinator: &Arc<GroupCoordinator>,
@@ -119,6 +162,7 @@ impl Consumer {
     ) -> Result<()> {
         match outcome {
             Ok(round) => {
+                self.metrics.join_rounds.inc();
                 let owes_rejoin = round.gave_up_reported();
                 let protocol = if coordinator.is_cooperative() {
                     Protocol::Cooperative
@@ -132,31 +176,31 @@ impl Consumer {
                 }
                 Ok(())
             }
-            Err(error)
-                if error.is_retriable()
-                    || is_coordinator_retriable(&error)
-                    || matches!(
-                        error,
-                        KrafkaError::Broker {
-                            code: ErrorCode::UnknownMemberId
-                                | ErrorCode::IllegalGeneration
-                                | ErrorCode::RebalanceInProgress
-                                | ErrorCode::MemberIdRequired,
-                            ..
-                        }
-                    ) =>
-            {
-                warn!(
-                    group = coordinator.group_id(),
-                    "Join failed, retrying: {error}"
-                );
-                coordinator.request_rejoin();
-                Ok(())
-            }
-            Err(error) => {
-                coordinator.request_rejoin();
-                Err(error)
-            }
+            Err(error) => match JoinOutcome::of(&error) {
+                JoinOutcome::Superseded => {
+                    self.metrics.join_rounds_superseded.inc();
+                    debug!(
+                        group = coordinator.group_id(),
+                        "A newer join round began before this member synced; joining it"
+                    );
+                    coordinator.request_rejoin();
+                    Ok(())
+                }
+                JoinOutcome::Retriable => {
+                    self.metrics.join_rounds_failed.inc();
+                    warn!(
+                        group = coordinator.group_id(),
+                        "Join failed, retrying: {error}"
+                    );
+                    coordinator.request_rejoin();
+                    Ok(())
+                }
+                JoinOutcome::Fatal => {
+                    self.metrics.join_rounds_failed.inc();
+                    coordinator.request_rejoin();
+                    Err(error)
+                }
+            },
         }
     }
 
