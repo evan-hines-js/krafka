@@ -194,6 +194,7 @@ impl GroupCoordinator {
                     );
                     self.reset_for_kip848_fencing();
                     self.membership_lost.store(true, Ordering::Release);
+                    self.heartbeat.raise();
                 }
                 code => {
                     self.invalidate_coordinator_on_error(code);
@@ -245,10 +246,15 @@ impl GroupCoordinator {
             if !self.target_assignment.read().is_empty() {
                 self.resolve_target_assignment();
             } else if response.member_epoch > 0 {
-                let mut inner = self.inner.write();
-                if inner.state != GroupState::Stable {
+                let stabilised = {
+                    let mut inner = self.inner.write();
+                    let stabilised = inner.state != GroupState::Stable;
                     inner.state = GroupState::Stable;
+                    stabilised
+                };
+                if stabilised {
                     self.assignment_changed.store(true, Ordering::Release);
+                    self.heartbeat.raise();
                 }
             }
             return Ok(());
@@ -297,11 +303,18 @@ impl GroupCoordinator {
                 }
             }
         }
-        let mut inner = self.inner.write();
-        if inner.assignment != assignment || inner.state != GroupState::Stable {
-            inner.assignment = assignment;
-            inner.state = GroupState::Stable;
+        let changed = {
+            let mut inner = self.inner.write();
+            let changed = inner.assignment != assignment || inner.state != GroupState::Stable;
+            if changed {
+                inner.assignment = assignment;
+                inner.state = GroupState::Stable;
+            }
+            changed
+        };
+        if changed {
             self.assignment_changed.store(true, Ordering::Release);
+            self.heartbeat.raise();
         }
         unresolved
     }
@@ -351,6 +364,7 @@ impl GroupCoordinator {
 
                         if poll_tracker.is_expired() {
                             if poll_tracker.mark_exceeded() {
+                                heartbeat.raise();
                                 warn!(
                                     "Application has not called poll() for {:?}, exceeding \
                                      max_poll_interval ({:?}); leaving group '{}' so its \

@@ -2,8 +2,11 @@
 //! behind `max_poll_interval`, and the flags the heartbeat tasks raise for the
 //! poll path.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+
+use crate::consumer::changes::Changes;
 
 /// Tracks how long it has been since the application last called `poll()`.
 ///
@@ -83,8 +86,13 @@ impl PollTracker {
 }
 
 /// Flags the heartbeat task raises for the poll path, and whether it runs.
+///
+/// Every flag raised for the poll path also raises [`Changes`], so a poll
+/// waiting with nothing to fetch acts on it at once.
 #[derive(Debug, Default)]
 pub(crate) struct HeartbeatController {
+    /// The consumer's changes signal, raised with every group event.
+    changes: Arc<Changes>,
     /// Whether a heartbeat task is running.
     running: AtomicBool,
     /// The coordinator asked for a rebalance.
@@ -107,8 +115,21 @@ impl HeartbeatController {
         self.running.store(false, Ordering::Release);
     }
 
+    /// The signal a waiting poll wakes on.
+    pub(crate) fn changes(&self) -> &Arc<Changes> {
+        &self.changes
+    }
+
+    /// Wake a waiting poll for a group event recorded elsewhere: a finished
+    /// join round, a new KIP-848 assignment, a lost membership, an expired
+    /// poll interval.
+    pub(crate) fn raise(&self) {
+        self.changes.raise();
+    }
+
     pub(crate) fn signal_rebalance(&self) {
         self.rebalance_needed.store(true, Ordering::Release);
+        self.changes.raise();
     }
 
     pub(crate) fn take_rebalance_needed(&self) -> bool {
@@ -119,6 +140,7 @@ impl HeartbeatController {
     pub(crate) fn signal_member_invalidated(&self) {
         self.member_invalidated.store(true, Ordering::Release);
         self.rebalance_needed.store(true, Ordering::Release);
+        self.changes.raise();
     }
 
     pub(crate) fn take_member_invalidated(&self) -> bool {

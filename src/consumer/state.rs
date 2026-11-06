@@ -825,6 +825,22 @@ impl SubscriptionState {
         targets
     }
 
+    /// When the next unpaused partition's backoff ends, if one is backing
+    /// off: the one instant at which time alone makes a partition
+    /// fetchable, positioned or validated again. A consumer whose every
+    /// partition is paused has none, and nothing is scanned to find that out.
+    pub(super) fn next_backoff_end(&self, now: Instant) -> Option<Instant> {
+        if self.partitions.len() == self.tally.paused {
+            return None;
+        }
+        self.partitions
+            .values()
+            .filter(|r| !r.paused)
+            .filter_map(|r| r.backoff.map(|(next, _)| next))
+            .filter(|&next| next > now)
+            .min()
+    }
+
     /// Install a fetch result, if the partition is still where the fetch was
     /// issued from. A result with no records but a later next offset (control
     /// batches, compaction gaps) moves the position directly. Returns whether

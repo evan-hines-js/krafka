@@ -211,7 +211,6 @@ partitions and commits nothing.
 | `partition_assignment_strategies` | `Vec<PartitionAssignmentStrategy>` | `[Range, CooperativeSticky]` | Preference-ordered assignor list, advertised in JoinGroup (`partition.assignment.strategy`). The Java default; it lets a group move from eager to cooperative in one rolling bounce. `partition_assignment_strategy` sets a single one. |
 | `client_rack` | String | none | Rack for closest-replica fetching (KIP-392) |
 | `lag_staleness_threshold` | Duration | `60s` | Watermarks older than this are reported stale by `lag()` |
-| `idle_poll_backoff` | Duration | `10ms` | Backoff between polls when nothing can be fetched. Set to `Duration::ZERO` for minimum latency. |
 | `max_decompressed_size` | usize | `128MiB` | Decompression-bomb limit per record batch |
 | `initial_offsets` | `(TopicPartition, Offset)` pairs | — | Start offsets used before `auto_offset_reset` |
 | `rebalance_listener` | `impl ConsumerRebalanceListener` | none | Assignment-change callbacks |

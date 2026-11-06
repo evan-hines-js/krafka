@@ -122,6 +122,7 @@ impl GroupCoordinator {
                 );
             }
             coordinator.rejoin_in_flight.send_replace(false);
+            coordinator.heartbeat.raise();
         });
     }
 
@@ -568,6 +569,7 @@ impl GroupCoordinator {
 
                         if poll_tracker.is_expired() {
                             if poll_tracker.mark_exceeded() {
+                                heartbeat.raise();
                                 warn!(
                                     "Application has not called poll() for {:?}, exceeding \
                                      max_poll_interval ({:?}); leaving group '{}' so its \
