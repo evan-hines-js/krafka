@@ -198,6 +198,20 @@ pub struct ConsumerMetrics {
     pub errors: u64,
     /// Assignment changes applied.
     pub rebalances: u64,
+    /// Classic join rounds (`JoinGroup` then `SyncGroup`) that ended with
+    /// this member's assignment.
+    pub join_rounds: u64,
+    /// Classic join rounds a newer round replaced before this member's
+    /// `SyncGroup` was answered (`REBALANCE_IN_PROGRESS`): a step of the
+    /// protocol while members come and go, after which the member joins
+    /// the newer round. Not a failure.
+    pub join_rounds_superseded: u64,
+    /// Classic join rounds that failed: the coordinator unreachable or
+    /// moved past the client's retries, a request timed out, the member
+    /// fenced or forgotten (`UNKNOWN_MEMBER_ID`, `ILLEGAL_GENERATION`,
+    /// `FENCED_INSTANCE_ID`), or any other error. Each also logs a `warn!`
+    /// naming the error.
+    pub join_rounds_failed: u64,
     /// Partitions repositioned by a seek.
     pub seeks: u64,
     /// Record batches that failed to decode: CRC mismatch, unknown magic,
@@ -237,6 +251,9 @@ impl ConsumerMetrics {
         self.commits += other.commits;
         self.errors += other.errors;
         self.rebalances += other.rebalances;
+        self.join_rounds += other.join_rounds;
+        self.join_rounds_superseded += other.join_rounds_superseded;
+        self.join_rounds_failed += other.join_rounds_failed;
         self.seeks += other.seeks;
         self.batch_decode_errors += other.batch_decode_errors;
         self.fetch_session_resets += other.fetch_session_resets;
@@ -545,6 +562,30 @@ impl Metrics {
                 "coordinator.rebalance.total",
                 "Assignment changes applied.",
                 c.rebalances,
+            ),
+            s(
+                Consumer,
+                Counter,
+                "krafka_consumer_join_rounds_total",
+                "coordinator.join.total",
+                "Classic join rounds that ended with this member's assignment.",
+                c.join_rounds,
+            ),
+            s(
+                Consumer,
+                Counter,
+                "krafka_consumer_join_rounds_superseded_total",
+                "coordinator.join.superseded.total",
+                "Classic join rounds a newer round replaced before this member synced.",
+                c.join_rounds_superseded,
+            ),
+            s(
+                Consumer,
+                Counter,
+                "krafka_consumer_join_rounds_failed_total",
+                "coordinator.join.failed.total",
+                "Classic join rounds that failed.",
+                c.join_rounds_failed,
             ),
             s(
                 Consumer,
@@ -1206,6 +1247,9 @@ pub(crate) struct ConsumerRecorder {
     pub(crate) commits: Counter,
     pub(crate) errors: Counter,
     pub(crate) rebalances: Counter,
+    pub(crate) join_rounds: Counter,
+    pub(crate) join_rounds_superseded: Counter,
+    pub(crate) join_rounds_failed: Counter,
     pub(crate) seeks: Counter,
     pub(crate) batch_decode_errors: Counter,
     pub(crate) fetch_session_resets: Counter,
@@ -1267,6 +1311,9 @@ impl ConsumerRecorder {
             commits: self.commits.get(),
             errors: self.errors.get(),
             rebalances: self.rebalances.get(),
+            join_rounds: self.join_rounds.get(),
+            join_rounds_superseded: self.join_rounds_superseded.get(),
+            join_rounds_failed: self.join_rounds_failed.get(),
             seeks: self.seeks.get(),
             batch_decode_errors: self.batch_decode_errors.get(),
             fetch_session_resets: self.fetch_session_resets.get(),

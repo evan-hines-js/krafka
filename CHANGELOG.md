@@ -13,6 +13,22 @@ not a complete record.
 
 ## [Unreleased]
 
+### Added
+
+- `ConsumerMetrics::join_rounds`, `join_rounds_superseded` and
+  `join_rounds_failed` (`krafka_consumer_join_rounds_total`,
+  `krafka_consumer_join_rounds_superseded_total`,
+  `krafka_consumer_join_rounds_failed_total`): how each classic join round
+  ended.
+
+### Fixed
+
+- A classic join round whose `SyncGroup` is answered
+  `REBALANCE_IN_PROGRESS` (a newer round began while members came and went)
+  is counted superseded and logged at debug: the member joins the newer
+  round. It was logged as "Join failed, retrying" at warn, so a scale-out
+  read as a storm of failures.
+
 ## [0.28.2] — 2026-11-06
 
 ### Fixed
