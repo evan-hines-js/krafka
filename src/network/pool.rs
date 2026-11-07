@@ -405,6 +405,19 @@ impl ConnectionPool {
         })?
     }
 
+    /// When the pool dials `address` again while a failed dial holds it in
+    /// its reconnect backoff (a call before then is refused at once); `None`
+    /// when a call would dial it now.
+    pub(crate) fn redial_at(&self, address: &str) -> Option<Instant> {
+        let now = Instant::now();
+        self.state
+            .read()
+            .reconnect
+            .get(address)
+            .map(|state| state.next_attempt_at)
+            .filter(|at| *at > now)
+    }
+
     /// Under the write lock: reuse, join a running dial, fail fast inside the
     /// backoff window, refuse at the cap, or start a dial.
     fn start_dial(&self, key: PoolKey) -> Result<DialStart> {

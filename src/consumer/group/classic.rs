@@ -108,6 +108,17 @@ impl GroupCoordinator {
         let coordinator = Arc::clone(self);
         tokio::spawn(async move {
             let outcome = coordinator.join_and_sync().await;
+            // A round refused because the pool will not dial what it needs
+            // yet is retried no sooner than the pool dials again: the round
+            // stays in flight until then, so no poll starts the next one
+            // into the same refusal (kind, 2026-11-06: one failed DNS lookup,
+            // then ~4,000 rounds a second, each refused at once inside the
+            // ~50 ms reconnect backoff, on every group of the worker).
+            if outcome.is_err()
+                && let Some(at) = coordinator.redial_at()
+            {
+                tokio::time::sleep_until(at).await;
+            }
             if coordinator.membership_epoch.load(Ordering::Acquire) == epoch {
                 if outcome.is_ok() && restart_heartbeat {
                     coordinator.start_heartbeat_task();

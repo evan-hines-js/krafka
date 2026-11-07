@@ -211,6 +211,9 @@ pub(crate) struct GroupCoordinator {
     /// coordination connection, fetched per request so the pool's
     /// replacement rules (dead socket, KIP-368 re-authentication) apply.
     coordinator_addr: RwLock<Option<String>>,
+    /// The coordinator address last asked of the pool: a round refused there
+    /// waits out its reconnect backoff before it is retried.
+    coordinator_asked: RwLock<Option<String>>,
     /// This member's own coordination connection to it.
     channel: crate::network::CoordinationChannel,
     coordinator_id: Mutex<Option<i32>>,
@@ -288,6 +291,7 @@ impl GroupCoordinator {
             heartbeat_interval,
             rebalance_timeout,
             coordinator_addr: RwLock::new(None),
+            coordinator_asked: RwLock::new(None),
             channel: crate::network::CoordinationChannel::next(),
             coordinator_id: Mutex::new(None),
             inner: Arc::new(RwLock::new(GroupInner::initial())),
@@ -662,10 +666,36 @@ impl GroupCoordinator {
                 })?
             }
         };
+        *self.coordinator_asked.write() = Some(address.clone());
         self.pool
             .get_coordinator_connection(&address, self.channel)
             .await
             .inspect_err(|_| self.drop_coordinator())
+    }
+
+    /// When the pool dials again what a round of this member needs, while
+    /// it refuses every call at once inside a reconnect backoff: the
+    /// coordinator last asked, or, with none asked, every broker the
+    /// coordinator is found through (the earliest of them). `None` once a
+    /// round would dial now.
+    pub(crate) fn redial_at(&self) -> Option<tokio::time::Instant> {
+        if let Some(asked) = self.coordinator_asked.read().clone()
+            && let Some(at) = self.pool.redial_at(&asked)
+        {
+            return Some(at);
+        }
+        let mut addresses: Vec<String> = self
+            .metadata
+            .brokers()
+            .iter()
+            .map(|broker| broker.address().to_string())
+            .collect();
+        addresses.extend(self.metadata.bootstrap_servers());
+        addresses
+            .iter()
+            .map(|address| self.pool.redial_at(address))
+            .collect::<Option<Vec<_>>>()
+            .and_then(|ats| ats.into_iter().min())
     }
 
     async fn get_any_connection(&self) -> Result<Arc<BrokerConnection>> {
