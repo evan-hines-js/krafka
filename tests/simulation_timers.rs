@@ -322,3 +322,65 @@ fn a_refused_fetch_backs_off_instead_of_spinning() {
     assert_eq!(polled.unwrap(), 0);
     assert!(elapsed >= Duration::from_secs(1), "{elapsed:?}");
 }
+
+/// A member whose coordinator cannot be dialed starts its next join round
+/// no sooner than the pool would dial the coordinator again. Inside the
+/// reconnect backoff the pool refuses the coordinator connection at once, so
+/// a round started there fails without a dial: one round per dial, however
+/// often the application polls. Every round re-discovers the coordinator,
+/// so rounds are counted as FindCoordinator requests and dials as the
+/// ApiVersions handshakes the coordinator receives (each one dropped).
+#[tokio::test(start_paused = true)]
+async fn a_join_round_waits_out_the_reconnect_backoff() {
+    const DIALS: usize = 6;
+    const MAX_POLLS: usize = 100_000;
+    let broker = FakeBroker::start_in_memory(2);
+    broker.create_topic("t", 1);
+    broker.set_leader("t", 0, 0);
+    broker.set_group_coordinator("g", 1);
+    broker.on(ApiKey::ApiVersions, |request| {
+        if request.node_id == 1 {
+            Control::Disconnect
+        } else {
+            Control::Pass
+        }
+    });
+    let dials = |broker: &FakeBroker| {
+        broker
+            .request_nodes(ApiKey::ApiVersions)
+            .into_iter()
+            .filter(|node| *node == 1)
+            .count()
+    };
+    let consumer = broker
+        .kafka()
+        .connect()
+        .await
+        .unwrap()
+        .consumer("g")
+        .auto_offset_reset(AutoOffsetReset::Earliest)
+        .build()
+        .await
+        .unwrap();
+    consumer.subscribe(["t"]).await.unwrap();
+
+    let mut polls = 0;
+    while dials(&broker) < DIALS && polls < MAX_POLLS {
+        assert!(
+            consumer
+                .poll(Duration::from_millis(10))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        polls += 1;
+    }
+    let dials = dials(&broker);
+    let rounds = broker.request_count(ApiKey::FindCoordinator);
+    assert_eq!(dials, DIALS, "{polls} polls made {dials} dials");
+    assert_eq!(
+        rounds, dials,
+        "{rounds} join rounds for {dials} dials of the coordinator in {polls} polls"
+    );
+    drop(consumer);
+}

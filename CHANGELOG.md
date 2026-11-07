@@ -13,6 +13,14 @@ not a complete record.
 
 ## [Unreleased]
 
+### Fixed
+
+- A classic-protocol member whose group coordinator cannot be dialed no longer
+  starts a join round on every `poll`. Inside the pool's reconnect backoff each
+  such round was refused at once without a dial and logged `Join failed,
+  retrying`; a failed round now stays in flight until the pool would dial the
+  coordinator again, so there is one round per dial.
+
 ## [0.28.2] — 2026-11-06
 
 ### Fixed

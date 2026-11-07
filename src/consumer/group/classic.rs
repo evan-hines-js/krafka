@@ -108,6 +108,14 @@ impl GroupCoordinator {
         let coordinator = Arc::clone(self);
         tokio::spawn(async move {
             let outcome = coordinator.join_and_sync().await;
+            // A round the pool refused inside a reconnect backoff stays in
+            // flight until the pool would dial again, so the next poll does
+            // not start another round into the same refusal.
+            if outcome.is_err()
+                && let Some(at) = coordinator.redial_at()
+            {
+                tokio::time::sleep_until(at).await;
+            }
             if coordinator.membership_epoch.load(Ordering::Acquire) == epoch {
                 if outcome.is_ok() && restart_heartbeat {
                     coordinator.start_heartbeat_task();
